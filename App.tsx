@@ -32,11 +32,13 @@ import {
   AlertTriangle
 } from 'lucide-react';
 import { Post, Comment, SortOption } from './types';
-import { INITIAL_POSTS, POSTS_PER_PAGE } from './constants';
+import { POSTS_PER_PAGE } from './constants';
 import { generateExcerpt } from './services/geminiService';
 import { askMOSS } from './services/mossService';
 
 const COMMENTS_PER_PAGE = 5;
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
+const DEFAULT_COVER = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&q=80&w=800";
 
 // --- 类型扩展 ---
 interface UserData {
@@ -218,10 +220,7 @@ const MossChat: React.FC = () => {
 // --- 主应用组件 ---
 
 export default function App() {
-  const [posts, setPosts] = useState<Post[]>(() => {
-    const saved = localStorage.getItem('neural_archive_posts');
-    return saved ? JSON.parse(saved) : INITIAL_POSTS;
-  });
+  const [posts, setPosts] = useState<Post[]>([]);
   
   // 用户与权限系统
   const [currentUser, setCurrentUser] = useState<UserData | null>(() => {
@@ -230,7 +229,7 @@ export default function App() {
   });
   const [users, setUsers] = useState<UserData[]>(() => {
     const saved = localStorage.getItem('lx_registered_users');
-    const defaultUsers = [{ username: 'lx', password: '123456' }];
+    const defaultUsers: UserData[] = [];
     return saved ? JSON.parse(saved) : defaultUsers;
   });
   const [showAuth, setShowAuth] = useState(false);
@@ -256,10 +255,6 @@ export default function App() {
 
   // 同步到 LocalStorage
   useEffect(() => {
-    localStorage.setItem('neural_archive_posts', JSON.stringify(posts));
-  }, [posts]);
-
-  useEffect(() => {
     localStorage.setItem('lx_registered_users', JSON.stringify(users));
   }, [users]);
 
@@ -270,6 +265,27 @@ export default function App() {
       localStorage.removeItem('lx_current_user');
     }
   }, [currentUser]);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/posts`);
+        if (!res.ok) {
+          throw new Error(`Load posts failed: ${res.status}`);
+        }
+        const data = await res.json();
+        if (active) {
+          setPosts(Array.isArray(data.posts) ? data.posts : []);
+        }
+      } catch (error) {
+        console.error('Load posts error:', error);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const toggleMusic = useCallback(() => {
     const audio = document.getElementById('bgm') as HTMLAudioElement;
@@ -312,12 +328,21 @@ export default function App() {
     currentPage * POSTS_PER_PAGE
   ), [filteredPosts, currentPage]);
 
-  const handleLike = useCallback((id: string) => {
+  const handleLike = useCallback(async (id: string) => {
     if (!currentUser) {
       setShowAuth(true);
       return;
     }
-    setPosts(prev => prev.map(p => p.id === id ? { ...p, likes: p.likes + 1 } : p));
+    try {
+      const res = await fetch(`${API_BASE}/posts/${id}/like`, { method: 'POST' });
+      if (!res.ok) {
+        throw new Error(`Like failed: ${res.status}`);
+      }
+      const data = await res.json();
+      setPosts(prev => prev.map(p => p.id === id ? { ...p, likes: data.likes ?? p.likes } : p));
+    } catch (error) {
+      console.error('Like Error:', error);
+    }
   }, [currentUser]);
 
   const fetchDungeonLocation = async (): Promise<string> => {
@@ -351,79 +376,149 @@ export default function App() {
     }
     if (!comment.trim() && !imageUrl) return;
     const dungeon = await fetchDungeonLocation();
-    const newComment: Comment = {
-      id: Math.random().toString(36).substr(2, 9),
-      author: currentUser.username,
-      content: comment,
-      createdAt: Date.now(),
-      likes: 0,
-      imageUrl: imageUrl,
-      location: dungeon
-    };
-    setPosts(prev => prev.map(p => p.id === postId ? { ...p, comments: [...p.comments, newComment] } : p));
+    try {
+      const res = await fetch(`${API_BASE}/posts/${postId}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          author: currentUser.username,
+          content: comment,
+          imageBase64: imageUrl || null,
+          location: dungeon
+        })
+      });
+      if (!res.ok) {
+        throw new Error(`Add comment failed: ${res.status}`);
+      }
+      const data = await res.json();
+      const newComment = data.comment;
+      setPosts(prev => prev.map(p => p.id === postId ? { ...p, comments: [newComment, ...p.comments] } : p));
+    } catch (error) {
+      console.error('Add Comment Error:', error);
+    }
   }, [currentUser]);
 
-  const handleLikeComment = useCallback((postId: string, commentId: string) => {
+  const handleLikeComment = useCallback(async (postId: string, commentId: string) => {
     if (!currentUser) {
       setShowAuth(true);
       return;
     }
-    setPosts(prev => prev.map(p => 
-      p.id === postId 
-      ? { ...p, comments: p.comments.map(c => c.id === commentId ? { ...c, likes: c.likes + 1 } : c) } 
-      : p
-    ));
+    try {
+      const res = await fetch(`${API_BASE}/comments/${commentId}/like`, { method: 'POST' });
+      if (!res.ok) {
+        throw new Error(`Like comment failed: ${res.status}`);
+      }
+      const data = await res.json();
+      setPosts(prev => prev.map(p =>
+        p.id === postId
+          ? { ...p, comments: p.comments.map(c => c.id === commentId ? { ...c, likes: data.likes ?? c.likes } : c) }
+          : p
+      ));
+    } catch (error) {
+      console.error('Like Comment Error:', error);
+    }
   }, [currentUser]);
 
   const handleDeleteComment = useCallback((postId: string, commentId: string) => {
-    if (!isAdmin) return;
+    if (!isAdmin || !currentUser) return;
     setConfirmModal({
       isOpen: true,
-      title: 'MOSS WARNING: 评论移除',
-      message: '检测到非法通讯应答。确认对该数据块执行“彻底删除”操作？此过程不可逆。',
-      onConfirm: () => {
-        setPosts(prev => prev.map(p => 
-          p.id === postId 
-          ? { ...p, comments: p.comments.filter(c => c.id !== commentId) } 
-          : p
-        ));
+      title: 'MOSS WARNING: DELETE COMMENT',
+      message: 'Confirm delete this comment?',
+      onConfirm: async () => {
+        try {
+          const res = await fetch(`${API_BASE}/posts/${postId}/comments/${commentId}`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
+          });
+          if (!res.ok) {
+            throw new Error(`Delete comment failed: ${res.status}`);
+          }
+          setPosts(prev => prev.map(p =>
+            p.id === postId
+              ? { ...p, comments: p.comments.filter(c => c.id !== commentId) }
+              : p
+          ));
+        } catch (error) {
+          console.error('Delete Comment Error:', error);
+        }
       }
     });
-  }, [isAdmin]);
+  }, [isAdmin, currentUser]);
 
   const handleDeletePost = (id: string) => {
-    if (!id || !isAdmin) return;
+    if (!id || !isAdmin || !currentUser) return;
     setConfirmModal({
       isOpen: true,
-      title: 'MOSS WARNING: 档案离线',
-      message: '检测到高权限抹除请求。确认将该档案块从领航者空间站数据库中永久移除？这可能会导致文明记录的不完整。',
-      onConfirm: () => {
-        setPosts(currentPosts => currentPosts.filter(p => p.id !== id));
-        if (selectedPostId === id) setSelectedPostId(null);
+      title: 'MOSS WARNING: DELETE POST',
+      message: 'Confirm delete this post?',
+      onConfirm: async () => {
+        try {
+          const res = await fetch(`${API_BASE}/posts/${id}`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
+          });
+          if (!res.ok) {
+            throw new Error(`Delete post failed: ${res.status}`);
+          }
+          setPosts(currentPosts => currentPosts.filter(p => p.id !== id));
+          if (selectedPostId === id) setSelectedPostId(null);
+        } catch (error) {
+          console.error('Delete Post Error:', error);
+        }
       }
     });
   };
 
-  const handleAuth = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleAuth = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
     const username = (formData.get('username') as string).trim();
     const password = formData.get('password') as string;
     if (!username || !password) return;
-    const existingUser = users.find(u => u.username === username);
-    if (existingUser) {
-      if (existingUser.password === password) {
-        setCurrentUser(existingUser);
+
+    const localUser = users.find(u => u.username === username);
+    if (localUser) {
+      if (localUser.password === password) {
+        setCurrentUser(localUser);
         setShowAuth(false);
-      } else {
-        alert('MOSS：校验失败，密码不匹配。');
+        return;
       }
-    } else {
-      const newUser = { username, password };
-      setUsers(prev => [...prev, newUser]);
-      setCurrentUser(newUser);
-      setShowAuth(false);
-      alert(`MOSS：新用户 ${username} 注册并接入成功。`);
+      alert('MOSS: invalid credentials.');
+      return;
+    }
+
+    try {
+      const loginRes = await fetch(`${API_BASE}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+
+      if (loginRes.ok) {
+        const newUser = { username, password };
+        setUsers(prev => [...prev, newUser]);
+        setCurrentUser(newUser);
+        setShowAuth(false);
+        return;
+      }
+
+      if (loginRes.status === 404) {
+        alert('MOSS: user not found.');
+        return;
+      }
+
+      if (loginRes.status === 401) {
+        alert('MOSS: invalid credentials.');
+        return;
+      }
+
+      alert('MOSS: authentication failed.');
+    } catch (error) {
+      console.error('Auth Error:', error);
+      alert('MOSS: server unavailable.');
     }
   };
 
@@ -438,7 +533,7 @@ export default function App() {
 
   const handleSavePost = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!isAdmin) return;
+    if (!isAdmin || !currentUser) return;
     const formData = new FormData(e.currentTarget);
     const title = formData.get('title') as string;
     const content = formData.get('content') as string;
@@ -448,19 +543,55 @@ export default function App() {
     if (!editingPost || editingPost.content !== content) {
       finalExcerpt = await generateExcerpt(title, content);
     }
-    const currentImage = uploadedImageUrl || editingPost?.imageUrl || `https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&q=80&w=800`;
-    if (editingPost) {
-      setPosts(prev => prev.map(p => p.id === editingPost.id ? {
-        ...p, title, content, tags, excerpt: finalExcerpt, imageUrl: currentImage
-      } : p));
-    } else {
-      const newPost: Post = {
-        id: Math.random().toString(36).substr(2, 9),
-        title, content, excerpt: finalExcerpt, author: currentUser?.username || 'LX_AUTH',
-        createdAt: Date.now(), tags, likes: 0, views: 0, comments: [], imageUrl: currentImage
-      };
-      setPosts(prev => [newPost, ...prev]);
+    const currentImage = uploadedImageUrl || editingPost?.imageUrl || DEFAULT_COVER;
+
+    try {
+      if (editingPost) {
+        const res = await fetch(`${API_BASE}/posts/${editingPost.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title,
+            content,
+            excerpt: finalExcerpt,
+            tags,
+            imageBase64: currentImage,
+            username: currentUser.username,
+            password: currentUser.password
+          })
+        });
+        if (!res.ok) {
+          throw new Error(`Update post failed: ${res.status}`);
+        }
+        setPosts(prev => prev.map(p => p.id === editingPost.id ? {
+          ...p, title, content, tags, excerpt: finalExcerpt, imageUrl: currentImage
+        } : p));
+      } else {
+        const res = await fetch(`${API_BASE}/posts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title,
+            content,
+            excerpt: finalExcerpt,
+            author: currentUser.username,
+            tags,
+            imageBase64: currentImage,
+            username: currentUser.username,
+            password: currentUser.password
+          })
+        });
+        if (!res.ok) {
+          throw new Error(`Create post failed: ${res.status}`);
+        }
+        const data = await res.json();
+        const newPost = data.post;
+        setPosts(prev => [newPost, ...prev]);
+      }
+    } catch (error) {
+      console.error('Save Post Error:', error);
     }
+
     setIsEditorOpen(false);
     setEditingPost(null);
     setUploadedImageUrl(null);
@@ -469,13 +600,20 @@ export default function App() {
   const viewPost = useCallback((id: string) => {
     setSelectedPostId(id);
     setPosts(prev => prev.map(p => p.id === id ? { ...p, views: p.views + 1 } : p));
+    fetch(`${API_BASE}/posts/${id}/view`, { method: 'POST' })
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (!data) return;
+        setPosts(prev => prev.map(p => p.id === id ? { ...p, views: data.views ?? p.views } : p));
+      })
+      .catch(err => console.error('View Error:', err));
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
   const currentPost = useMemo(() => posts.find(p => p.id === selectedPostId), [posts, selectedPostId]);
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen">
+    <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen app-scale">
       <MossChat />
       
       {/* 全局确认弹窗 */}
