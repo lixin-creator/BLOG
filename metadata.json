@@ -1,0 +1,10 @@
+
+{
+  "name": "领航者空间站: MOSS 核心枢纽",
+  "description": "基于《流浪地球》世界观的领航者空间站档案系统，LXBLOG 核心记录与 MOSS 决策支持。",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
