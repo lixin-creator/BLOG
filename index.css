@@ -1,0 +1,30 @@
+@media (max-width: 768px) {
+  .app-scale {
+    transform: none;
+  }
+
+  .moss-chat-panel {
+    width: calc(100vw - 32px);
+    height: 70vh;
+  }
+
+  .moss-chat-root {
+    right: 16px;
+    bottom: 16px;
+  }
+}
+
+.moss-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(248, 113, 113, 0.3);
+  border-top-color: rgba(248, 113, 113, 0.9);
+  border-radius: 9999px;
+  animation: mossSpin 0.9s linear infinite;
+}
+
+@keyframes mossSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}

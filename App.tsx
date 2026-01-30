@@ -1,4 +1,4 @@
-
+﻿
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Terminal, 
@@ -35,7 +35,8 @@ import { Post, Comment, SortOption } from './types';
 import { POSTS_PER_PAGE } from './constants';
 import { generateExcerpt } from './services/geminiService';
 import { askMOSS } from './services/mossService';
-// 浏览器语音合成作为最终播报通道
+import { synthesizeMossSpeech } from './services/ttsService';
+// 智谱克隆音色播报
 
 const COMMENTS_PER_PAGE = 5;
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
@@ -149,31 +150,21 @@ const CyberConfirmModal: React.FC<ConfirmModalConfig & { onClose: () => void }> 
 
 const MossChat: React.FC<{ username?: string }> = ({ username }) => {
   const [isOpen, setIsOpen] = useState(false);
-  const [messages, setMessages] = useState<{role: 'user' | 'moss', text: string}[]>([]);
+  const [messages, setMessages] = useState<{id: string; role: 'user' | 'moss'; text: string; fullText?: string}[]>([]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [floatingPos, setFloatingPos] = useState<{ x: number; y: number } | null>(null);
   const dragRef = useRef<{ offsetX: number; offsetY: number; moved: boolean; originLeft: number; originTop: number } | null>(null);
   const suppressClickRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastSpeakRef = useRef<{ text: string; at: number } | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const revealCancelRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
-
-  useEffect(() => {
-    if (!('speechSynthesis' in window)) return;
-    const loadVoices = () => {
-      setVoices(window.speechSynthesis.getVoices());
-    };
-    loadVoices();
-    window.speechSynthesis.onvoiceschanged = loadVoices;
-    return () => {
-      window.speechSynthesis.onvoiceschanged = null;
-    };
-  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -236,58 +227,106 @@ const MossChat: React.FC<{ username?: string }> = ({ username }) => {
     e.currentTarget.setPointerCapture(e.pointerId);
   };
 
-  const pickMossVoice = useCallback(() => {
-    if (voices.length === 0) return null;
-    const preferred = [
-      // 优先选择中文男声
-      voices.find(v => v.lang === 'zh-CN' && /yunyang|yunxi|kang|guy|male|man/i.test(v.name)),
-      voices.find(v => v.lang.startsWith('zh') && /yunyang|yunxi|kang|guy|male|man/i.test(v.name)),
-      voices.find(v => v.lang === 'zh-CN'),
-      voices.find(v => v.lang.startsWith('zh')),
-      voices.find(v => /microsoft|google|siri/i.test(v.name)),
-    ];
-    return preferred.find(Boolean) ?? voices[0];
-  }, [voices]);
-
-  const speakMoss = useCallback(async (text: string) => {
-    if (!isVoiceEnabled) return;
-    if (!('speechSynthesis' in window)) return;
-    const speakText = text.replace(/^MOSS：\s*/i, '').replace(/^MOSS:\s*/i, '');
-    const voice = pickMossVoice();
-    const utterance = new SpeechSynthesisUtterance(speakText);
-    if (voice) {
-      utterance.voice = voice;
-      utterance.lang = voice.lang;
-    } else {
-      utterance.lang = 'zh-CN';
+  const revealTextSync = useCallback((messageId: string, fullText: string, durationMs?: number) => {
+    if (revealCancelRef.current) {
+      revealCancelRef.current();
+      revealCancelRef.current = null;
     }
-    utterance.rate = 0.82;
-    utterance.pitch = 0.68;
-    utterance.volume = 0.9;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utterance);
-  }, [isVoiceEnabled, pickMossVoice]);
+    const start = performance.now();
+    const total = fullText.length;
+    const fallbackDuration = Math.max(1200, total * 45);
+    const finalDuration = Number.isFinite(durationMs) ? Math.max(600, durationMs as number) : fallbackDuration;
+    let hasStarted = false;
+
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const elapsed = performance.now() - start;
+      const progress = Math.min(1, elapsed / finalDuration);
+      const count = Math.max(1, Math.floor(progress * total));
+      if (!hasStarted && count > 0) {
+        hasStarted = true;
+        setIsTyping(false);
+      }
+      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, text: fullText.slice(0, count) } : m));
+      if (progress < 1) {
+        requestAnimationFrame(tick);
+      }
+    };
+    requestAnimationFrame(tick);
+    revealCancelRef.current = () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const speakMoss = useCallback(async (text: string, messageId?: string) => {
+    if (!isVoiceEnabled) return;
+    const speakText = text.replace(/^MOSS：\s*/i, '').replace(/^MOSS:\s*/i, '');
+    const now = Date.now();
+    if (lastSpeakRef.current && lastSpeakRef.current.text === speakText && now - lastSpeakRef.current.at < 3000) {
+      return;
+    }
+    lastSpeakRef.current = { text: speakText, at: now };
+
+    try {
+      const blob = await synthesizeMossSpeech(speakText);
+      if (ttsAudioRef.current) {
+        ttsAudioRef.current.pause();
+        URL.revokeObjectURL(ttsAudioRef.current.src);
+        ttsAudioRef.current = null;
+      }
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      ttsAudioRef.current = audio;
+      let durationMs: number | undefined;
+      audio.onloadedmetadata = () => {
+        if (Number.isFinite(audio.duration) && audio.duration > 0) {
+          durationMs = audio.duration * 1000;
+        }
+      };
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+      };
+      if (messageId) {
+        revealTextSync(messageId, text, durationMs);
+      } else {
+        setIsTyping(false);
+      }
+      await audio.play();
+    } catch (error) {
+      console.warn("TTS failed:", error);
+      if (messageId) {
+        setMessages(prev => prev.map(m => m.id === messageId ? { ...m, text: text } : m));
+      }
+      setIsTyping(false);
+    }
+  }, [isVoiceEnabled, revealTextSync]);
 
   const handleSend = async () => {
     if (!input.trim() || isTyping) return;
     const userMsg = input;
-    setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+    setMessages(prev => [...prev, { id: `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, role: 'user', text: userMsg }]);
     setInput('');
     setIsTyping(true);
 
     const response = await askMOSS(userMsg);
-    setMessages(prev => [...prev, { role: 'moss', text: response }]);
-    void speakMoss(response);
-    setIsTyping(false);
+    const mossId = `moss_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    if (isVoiceEnabled) {
+      setMessages(prev => [...prev, { id: mossId, role: 'moss', text: '', fullText: response }]);
+      void speakMoss(response, mossId);
+    } else {
+      setMessages(prev => [...prev, { id: mossId, role: 'moss', text: response }]);
+      setIsTyping(false);
+    }
   };
 
   return (
     <div
-      className="fixed z-[100] font-mono"
+      className="fixed z-[100] font-mono moss-chat-root"
       style={floatingPos ? { left: floatingPos.x, top: floatingPos.y } : { right: 24, bottom: 24 }}
     >
       {isOpen ? (
-        <div className="w-80 h-96 cyber-border-red bg-black/90 flex flex-col overflow-hidden animate-in zoom-in-95 duration-200 shadow-2xl text-red-500">
+        <div className="w-80 h-96 cyber-border-red bg-black/90 flex flex-col overflow-hidden animate-in zoom-in-95 duration-200 shadow-2xl text-red-500 moss-chat-panel">
           <div className="bg-red-900/40 p-3 border-b border-red-500 flex justify-between items-center relative">
             <span className="absolute inset-x-0 text-xs font-orbitron tracking-tighter text-red-100 uppercase text-center pointer-events-none">
               {`MOSS对话${username ? `${username}中校` : '终端'}`}
@@ -298,9 +337,16 @@ const MossChat: React.FC<{ username?: string }> = ({ username }) => {
             <div className="flex items-center gap-2">
               <button
                 onClick={() => {
-                  if (isVoiceEnabled) {
-                    window.speechSynthesis?.cancel();
+                  if (isVoiceEnabled && ttsAudioRef.current) {
+                    ttsAudioRef.current.pause();
+                    URL.revokeObjectURL(ttsAudioRef.current.src);
+                    ttsAudioRef.current = null;
                   }
+                  if (revealCancelRef.current) {
+                    revealCancelRef.current();
+                    revealCancelRef.current = null;
+                  }
+                  setMessages(prev => prev.map(m => m.fullText ? { ...m, text: m.fullText } : m));
                   setIsVoiceEnabled(v => !v);
                 }}
                 className="text-red-400 hover:text-white transition-colors"
@@ -318,14 +364,22 @@ const MossChat: React.FC<{ username?: string }> = ({ username }) => {
                 {username ? ` ${username}中校，请输入你的查询请求。` : '请问你的查询请求是什么？'}
               </p>
             )}
-            {messages.map((m, i) => (
-              <div key={i} className={`${m.role === 'user' ? 'text-right' : 'text-left'}`}>
-                <span className={`inline-block p-2 border ${m.role === 'user' ? 'border-cyan-900 text-cyan-400' : 'border-red-900 text-red-400'} bg-black/60`}>
-                  {m.text}
-                </span>
+            {messages.map((m) => {
+              if (m.role === 'moss' && !m.text) return null;
+              return (
+                <div key={m.id} className={`${m.role === 'user' ? 'text-right' : 'text-left'}`}>
+                  <span className={`inline-block p-2 border ${m.role === 'user' ? 'border-cyan-900 text-cyan-400' : 'border-red-900 text-red-400'} bg-black/60`}>
+                    {m.text}
+                  </span>
+                </div>
+              );
+            })}
+            {isTyping && (
+              <div className="flex items-center gap-2 text-red-400 text-[10px]">
+                <span className="moss-spinner"></span>
+                <span className="animate-pulse">MOSS 正在搜寻人类历史数据库...</span>
               </div>
-            ))}
-            {isTyping && <p className="text-red-400 animate-pulse text-[10px]">MOSS 正在搜寻人类历史数据库...</p>}
+            )}
           </div>
 
           <div className="p-3 border-t border-red-900 bg-red-900/10 flex gap-2">

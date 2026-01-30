@@ -74,6 +74,10 @@ const ensureAdminUser = async () => {
   );
 };
 
+let ttsQueue = Promise.resolve();
+let lastTtsAt = 0;
+const ttsCache = new Map();
+
 app.get("/api/health", async (_req, res) => {
   res.json({ status: "ok" });
 });
@@ -256,6 +260,102 @@ app.post("/api/comments/:id/like", async (req, res) => {
   await pool.query("UPDATE comments SET likes = likes + 1 WHERE id = ?", [id]);
   const [rows] = await pool.query("SELECT likes FROM comments WHERE id = ?", [id]);
   return res.json({ likes: rows[0]?.likes ?? 0 });
+});
+
+app.post("/api/tts", async (req, res) => {
+  try {
+    const { input, voice } = req.body || {};
+    if (!input) {
+      return res.status(400).json({ error: "Missing input" });
+    }
+    const apiKey = process.env.ZHIPU_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing ZHIPU_API_KEY" });
+    }
+
+    const key = `${voice || "streamer_male"}::${String(input).slice(0, 512)}`;
+    const cached = ttsCache.get(key);
+    if (cached && Date.now() - cached.at < 60000) {
+      res.setHeader("Content-Type", cached.type);
+      return res.send(cached.buffer);
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const runTask = async () => {
+      const now = Date.now();
+      const minInterval = 2000;
+      if (now - lastTtsAt < minInterval) {
+        await sleep(minInterval - (now - lastTtsAt));
+      }
+      lastTtsAt = Date.now();
+
+      const maxRetries = 3;
+      let response = null;
+      let lastDetail = "";
+
+      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20000);
+        try {
+          response = await fetch("https://open.bigmodel.cn/api/paas/v4/audio/speech", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKey}`
+            },
+            body: JSON.stringify({
+              model: "glm-tts",
+              input: String(input).slice(0, 1024),
+              voice: voice || "streamer_male",
+              response_format: "wav",
+              stream: false,
+              speed: 1.0,
+              volume: 1.0
+            }),
+            signal: controller.signal
+          });
+        } catch (err) {
+          lastDetail = err?.message || "fetch failed";
+          if (attempt === maxRetries) throw err;
+          const delay = 800 * Math.pow(2, attempt);
+          await sleep(delay);
+          continue;
+        } finally {
+          clearTimeout(timeoutId);
+        }
+
+        if (response.ok) break;
+        lastDetail = await response.text();
+        if (response.status !== 429 || attempt === maxRetries) break;
+        const delay = 800 * Math.pow(2, attempt);
+        await sleep(delay);
+      }
+
+      if (!response.ok) {
+        const error = new Error("TTS request failed");
+        error.status = response.status;
+        error.detail = lastDetail;
+        throw error;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const type = response.headers.get("content-type") || "audio/wav";
+      ttsCache.set(key, { buffer, type, at: Date.now() });
+      return { buffer, type };
+    };
+
+    const task = ttsQueue.then(runTask);
+    ttsQueue = task.catch(() => {});
+
+    const result = await task;
+    res.setHeader("Content-Type", result.type);
+    return res.send(result.buffer);
+  } catch (error) {
+    console.error("TTS error:", error);
+    const status = error?.status || 500;
+    const detail = error?.detail || "";
+    return res.status(status).json({ error: "TTS server error", detail });
+  }
 });
 
 app.use((err, _req, res, _next) => {
