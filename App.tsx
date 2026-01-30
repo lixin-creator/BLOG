@@ -35,6 +35,7 @@ import { Post, Comment, SortOption } from './types';
 import { POSTS_PER_PAGE } from './constants';
 import { generateExcerpt } from './services/geminiService';
 import { askMOSS } from './services/mossService';
+// 浏览器语音合成作为最终播报通道
 
 const COMMENTS_PER_PAGE = 5;
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
@@ -146,16 +147,126 @@ const CyberConfirmModal: React.FC<ConfirmModalConfig & { onClose: () => void }> 
   );
 };
 
-const MossChat: React.FC = () => {
+const MossChat: React.FC<{ username?: string }> = ({ username }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<{role: 'user' | 'moss', text: string}[]>([]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [floatingPos, setFloatingPos] = useState<{ x: number; y: number } | null>(null);
+  const dragRef = useRef<{ offsetX: number; offsetY: number; moved: boolean; originLeft: number; originTop: number } | null>(null);
+  const suppressClickRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
+
+  useEffect(() => {
+    if (!('speechSynthesis' in window)) return;
+    const loadVoices = () => {
+      setVoices(window.speechSynthesis.getVoices());
+    };
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleMove = (e: PointerEvent) => {
+      if (!dragRef.current) return;
+      const dx = Math.abs(e.movementX);
+      const dy = Math.abs(e.movementY);
+      if (dx + dy > 2) dragRef.current.moved = true;
+      if (!floatingPos) {
+        setFloatingPos({ x: dragRef.current.originLeft, y: dragRef.current.originTop });
+      }
+      const next = {
+        x: e.clientX - dragRef.current.offsetX,
+        y: e.clientY - dragRef.current.offsetY
+      };
+      setFloatingPos(next);
+    };
+    const handleUp = () => {
+      if (dragRef.current?.moved) {
+        suppressClickRef.current = true;
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 150);
+      }
+      dragRef.current = null;
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen || !floatingPos) return;
+    const width = 320;
+    const height = 384;
+    const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+    const maxX = Math.max(8, window.innerWidth - width - 8);
+    const maxY = Math.max(8, window.innerHeight - height - 8);
+    const clamped = {
+      x: clamp(floatingPos.x, 8, maxX),
+      y: clamp(floatingPos.y, 8, maxY)
+    };
+    if (clamped.x !== floatingPos.x || clamped.y !== floatingPos.y) {
+      setFloatingPos(clamped);
+    }
+  }, [isOpen, floatingPos]);
+
+  const startDrag = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    dragRef.current = {
+      offsetX: e.clientX - rect.left,
+      offsetY: e.clientY - rect.top,
+      moved: false,
+      originLeft: rect.left,
+      originTop: rect.top
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const pickMossVoice = useCallback(() => {
+    if (voices.length === 0) return null;
+    const preferred = [
+      // 优先选择中文男声
+      voices.find(v => v.lang === 'zh-CN' && /yunyang|yunxi|kang|guy|male|man/i.test(v.name)),
+      voices.find(v => v.lang.startsWith('zh') && /yunyang|yunxi|kang|guy|male|man/i.test(v.name)),
+      voices.find(v => v.lang === 'zh-CN'),
+      voices.find(v => v.lang.startsWith('zh')),
+      voices.find(v => /microsoft|google|siri/i.test(v.name)),
+    ];
+    return preferred.find(Boolean) ?? voices[0];
+  }, [voices]);
+
+  const speakMoss = useCallback(async (text: string) => {
+    if (!isVoiceEnabled) return;
+    if (!('speechSynthesis' in window)) return;
+    const speakText = text.replace(/^MOSS：\s*/i, '').replace(/^MOSS:\s*/i, '');
+    const voice = pickMossVoice();
+    const utterance = new SpeechSynthesisUtterance(speakText);
+    if (voice) {
+      utterance.voice = voice;
+      utterance.lang = voice.lang;
+    } else {
+      utterance.lang = 'zh-CN';
+    }
+    utterance.rate = 0.82;
+    utterance.pitch = 0.68;
+    utterance.volume = 0.9;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  }, [isVoiceEnabled, pickMossVoice]);
 
   const handleSend = async () => {
     if (!input.trim() || isTyping) return;
@@ -166,23 +277,46 @@ const MossChat: React.FC = () => {
 
     const response = await askMOSS(userMsg);
     setMessages(prev => [...prev, { role: 'moss', text: response }]);
+    void speakMoss(response);
     setIsTyping(false);
   };
 
   return (
-    <div className="fixed bottom-6 right-6 z-[100] font-mono">
+    <div
+      className="fixed z-[100] font-mono"
+      style={floatingPos ? { left: floatingPos.x, top: floatingPos.y } : { right: 24, bottom: 24 }}
+    >
       {isOpen ? (
         <div className="w-80 h-96 cyber-border-red bg-black/90 flex flex-col overflow-hidden animate-in zoom-in-95 duration-200 shadow-2xl text-red-500">
-          <div className="bg-red-900/40 p-3 border-b border-red-500 flex justify-between items-center">
+          <div className="bg-red-900/40 p-3 border-b border-red-500 flex justify-between items-center relative">
+            <span className="absolute inset-x-0 text-xs font-orbitron tracking-tighter text-red-100 uppercase text-center pointer-events-none">
+              {`MOSS对话${username ? `${username}中校` : '终端'}`}
+            </span>
             <div className="flex items-center gap-2">
               <div className="w-3 h-3 rounded-full moss-eye animate-pulse"></div>
-              <span className="text-xs font-orbitron tracking-tighter text-red-100 uppercase">Moss Interface 550W</span>
             </div>
-            <button onClick={() => setIsOpen(false)} className="text-red-400 hover:text-white transition-colors"><X size={16}/></button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  if (isVoiceEnabled) {
+                    window.speechSynthesis?.cancel();
+                  }
+                  setIsVoiceEnabled(v => !v);
+                }}
+                className="text-red-400 hover:text-white transition-colors"
+                title={isVoiceEnabled ? '关闭语音' : '开启语音'}
+              >
+                {isVoiceEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+              </button>
+              <button onClick={() => setIsOpen(false)} className="text-red-400 hover:text-white transition-colors"><X size={16}/></button>
+            </div>
           </div>
           <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3 text-[12px]">
             {messages.length === 0 && (
-              <p className="text-red-800 text-center italic">MOSS：LX 计划已进入加速阶段。请问你的查询请求是什么？</p>
+              <p className="text-red-800 text-center italic">
+                MOSS：流浪地球计划已进入加速阶段。
+                {username ? ` ${username}中校，请输入你的查询请求。` : '请问你的查询请求是什么？'}
+              </p>
             )}
             {messages.map((m, i) => (
               <div key={i} className={`${m.role === 'user' ? 'text-right' : 'text-left'}`}>
@@ -191,8 +325,9 @@ const MossChat: React.FC = () => {
                 </span>
               </div>
             ))}
-            {isTyping && <p className="text-red-400 animate-pulse text-[10px]">MOSS 正在分析 LX 数据库...</p>}
+            {isTyping && <p className="text-red-400 animate-pulse text-[10px]">MOSS 正在搜寻人类历史数据库...</p>}
           </div>
+
           <div className="p-3 border-t border-red-900 bg-red-900/10 flex gap-2">
             <input 
               value={input}
@@ -206,8 +341,12 @@ const MossChat: React.FC = () => {
         </div>
       ) : (
         <button 
-          onClick={() => setIsOpen(true)}
+          onClick={() => {
+            if (suppressClickRef.current) return;
+            setIsOpen(true);
+          }}
           className="w-16 h-16 rounded-full moss-eye flex items-center justify-center border-2 border-red-600 animate-pulse group relative"
+          onPointerDown={startDrag}
         >
           <div className="absolute inset-0 rounded-full border border-red-500 scale-125 opacity-20 group-hover:opacity-100 transition-opacity"></div>
           <span className="text-[10px] text-white font-orbitron font-bold">MOSS</span>
@@ -613,8 +752,9 @@ export default function App() {
   const currentPost = useMemo(() => posts.find(p => p.id === selectedPostId), [posts, selectedPostId]);
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen app-scale">
-      <MossChat />
+    <>
+      <MossChat username={currentUser?.username} />
+      <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen app-scale">
       
       {/* 全局确认弹窗 */}
       <CyberConfirmModal 
@@ -837,7 +977,7 @@ export default function App() {
                       onClick={() => setUploadedImageUrl(null)}
                       className="text-[10px] text-orange-400 uppercase font-orbitron tracking-widest hover:text-orange-300 transition-colors"
                     >
-                      ??
+                      移除
                     </button>
                   )}
                 </div>
@@ -859,7 +999,8 @@ export default function App() {
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </>
   );
 }
 
