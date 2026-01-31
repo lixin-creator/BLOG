@@ -426,6 +426,10 @@ export default function App() {
     return saved ? JSON.parse(saved) : defaultUsers;
   });
   const [showAuth, setShowAuth] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [showWelcome, setShowWelcome] = useState(false);
+  const [welcomeUser, setWelcomeUser] = useState<string | null>(null);
+  const [welcomeFading, setWelcomeFading] = useState(false);
   const isAdmin = useMemo(() => currentUser?.username === 'lx', [currentUser]);
 
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -458,6 +462,29 @@ export default function App() {
       localStorage.removeItem('lx_current_user');
     }
   }, [currentUser]);
+
+  useEffect(() => {
+    if (showAuth) {
+      setAuthError(null);
+    }
+  }, [showAuth]);
+
+  useEffect(() => {
+    if (!showWelcome) return;
+    setWelcomeFading(false);
+    const fadeTimer = window.setTimeout(() => setWelcomeFading(true), 1200);
+    const closeTimer = window.setTimeout(() => setShowWelcome(false), 3000);
+    return () => {
+      window.clearTimeout(fadeTimer);
+      window.clearTimeout(closeTimer);
+    };
+  }, [showWelcome]);
+
+  const openWelcome = useCallback((username: string) => {
+    setWelcomeUser(username);
+    setShowWelcome(true);
+    setWelcomeFading(false);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -677,9 +704,11 @@ export default function App() {
       if (localUser.password === password) {
         setCurrentUser(localUser);
         setShowAuth(false);
+        setAuthError(null);
+        openWelcome(localUser.username);
         return;
       }
-      alert('MOSS: invalid credentials.');
+      setAuthError('密码输入错误');
       return;
     }
 
@@ -695,23 +724,25 @@ export default function App() {
         setUsers(prev => [...prev, newUser]);
         setCurrentUser(newUser);
         setShowAuth(false);
+        setAuthError(null);
+        openWelcome(newUser.username);
         return;
       }
 
       if (loginRes.status === 404) {
-        alert('MOSS: user not found.');
+        setAuthError('用户不存在');
         return;
       }
 
       if (loginRes.status === 401) {
-        alert('MOSS: invalid credentials.');
+        setAuthError('密码输入错误');
         return;
       }
 
-      alert('MOSS: authentication failed.');
+      setAuthError('登录失败，请稍后重试。');
     } catch (error) {
       console.error('Auth Error:', error);
-      alert('MOSS: server unavailable.');
+      setAuthError('服务器不可用，请稍后重试。');
     }
   };
 
@@ -986,16 +1017,59 @@ export default function App() {
             <form onSubmit={handleAuth} className="space-y-6">
               <div className="space-y-1">
                 <label className="text-[10px] text-red-600 uppercase font-orbitron tracking-widest flex items-center gap-2"><User size={12}/> Identifier</label>
-                <input name="username" required placeholder="USERNAME_STRING..." className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"/>
+                <input
+                  name="username"
+                  required
+                  placeholder="USERNAME_STRING..."
+                  onChange={() => authError && setAuthError(null)}
+                  className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"
+                />
               </div>
               <div className="space-y-1">
                 <label className="text-[10px] text-red-600 uppercase font-orbitron tracking-widest flex items-center gap-2"><Lock size={12}/> Encryption Key</label>
-                <input type="password" name="password" required placeholder="PASSWORD_MODULE..." className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"/>
+                <input
+                  type="password"
+                  name="password"
+                  required
+                  placeholder="PASSWORD_MODULE..."
+                  onChange={() => authError && setAuthError(null)}
+                  className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"
+                />
               </div>
+              {authError && (
+                <div className="border border-red-700/60 bg-red-950/40 p-3 text-xs text-red-200 font-mono" role="alert">
+                  {authError}
+                </div>
+              )}
               <div className="pt-4 space-y-3">
                 <CyberButton type="submit" variant="secondary" className="w-full py-4 text-lg">执行终端接入</CyberButton>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {showWelcome && welcomeUser && (
+        <div
+          className={`fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 ${welcomeFading ? 'opacity-0 transition-opacity duration-700' : 'opacity-100'}`}
+        >
+          <div className="cyber-border-red bg-black w-full max-w-md p-8 relative shadow-[0_0_50px_rgba(255,0,0,0.3)]">
+            <button
+              onClick={() => setShowWelcome(false)}
+              className="absolute top-4 right-4 text-red-500 hover:text-white"
+            >
+              <X size={24} />
+            </button>
+            <div className="text-center space-y-4">
+              <div className="w-16 h-16 bg-red-600 mx-auto flex items-center justify-center font-bold text-2xl text-white shadow-[0_0_20px_rgba(255,0,0,0.5)] uppercase font-orbitron">LX</div>
+              <h2 className="text-2xl font-orbitron text-red-500 uppercase tracking-widest cyber-glow-red">欢迎回来</h2>
+              <p className="text-sm text-red-200/80 font-mono">欢迎回来，{welcomeUser}中校</p>
+            </div>
+            <div className="pt-6">
+              <CyberButton variant="secondary" className="w-full" onClick={() => setShowWelcome(false)}>
+                进入终端
+              </CyberButton>
+            </div>
           </div>
         </div>
       )}
