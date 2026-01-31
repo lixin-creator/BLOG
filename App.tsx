@@ -46,6 +46,8 @@ const DEFAULT_COVER = "https://images.unsplash.com/photo-1451187580459-43490279c
 interface UserData {
   username: string;
   password: string;
+  rank?: string;
+  totalSeconds?: number;
 }
 
 interface ConfirmModalConfig {
@@ -55,6 +57,28 @@ interface ConfirmModalConfig {
   onConfirm: () => void;
   variant?: 'danger' | 'warning';
 }
+
+interface RankRule {
+  name: string;
+  thresholdSeconds: number;
+}
+
+interface RankBoardItem {
+  username: string;
+  rank: string;
+  totalSeconds: number;
+}
+
+const RANK_RULES: RankRule[] = [
+  { name: '士兵', thresholdSeconds: 0 },
+  { name: '军士', thresholdSeconds: 30 },
+  { name: '少校', thresholdSeconds: 120 },
+  { name: '中校', thresholdSeconds: 300 },
+  { name: '大校', thresholdSeconds: 600 },
+  { name: '少将', thresholdSeconds: 1800 },
+  { name: '中将', thresholdSeconds: 3600 },
+  { name: '上将', thresholdSeconds: 7200 }
+];
 
 // --- 子组件 ---
 
@@ -148,7 +172,7 @@ const CyberConfirmModal: React.FC<ConfirmModalConfig & { onClose: () => void }> 
   );
 };
 
-const MossChat: React.FC<{ username?: string }> = ({ username }) => {
+const MossChat: React.FC<{ username?: string; rank?: string }> = ({ username, rank }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<{id: string; role: 'user' | 'moss'; text: string; fullText?: string}[]>([]);
   const [input, setInput] = useState('');
@@ -329,7 +353,7 @@ const MossChat: React.FC<{ username?: string }> = ({ username }) => {
         <div className="w-80 h-96 cyber-border-red bg-black/90 flex flex-col overflow-hidden animate-in zoom-in-95 duration-200 shadow-2xl text-red-500 moss-chat-panel">
           <div className="bg-red-900/40 p-3 border-b border-red-500 flex justify-between items-center relative">
             <span className="absolute inset-x-0 text-xs font-orbitron tracking-tighter text-red-100 uppercase text-center pointer-events-none">
-              {`MOSS对话${username ? `${username}中校` : '终端'}`}
+              {`MOSS对话${username ? `${username}${rank || '士兵'}` : '终端'}`}
             </span>
             <div className="flex items-center gap-2">
               <div className="w-3 h-3 rounded-full moss-eye animate-pulse"></div>
@@ -361,7 +385,7 @@ const MossChat: React.FC<{ username?: string }> = ({ username }) => {
             {messages.length === 0 && (
               <p className="text-red-800 text-center italic">
                 MOSS：流浪地球计划已进入加速阶段。
-                {username ? ` ${username}中校，请输入你的查询请求。` : '请问你的查询请求是什么？'}
+                {username ? ` ${username}${rank || '士兵'}，请输入你的查询请求。` : '请问你的查询请求是什么？'}
               </p>
             )}
             {messages.map((m) => {
@@ -429,7 +453,17 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [showWelcome, setShowWelcome] = useState(false);
   const [welcomeUser, setWelcomeUser] = useState<string | null>(null);
+  const [welcomeRank, setWelcomeRank] = useState<string | null>(null);
   const [welcomeFading, setWelcomeFading] = useState(false);
+  const [showRankBoard, setShowRankBoard] = useState(false);
+  const [rankBoard, setRankBoard] = useState<RankBoardItem[]>([]);
+  const [rankBoardLoading, setRankBoardLoading] = useState(false);
+  const [rankBoardError, setRankBoardError] = useState<string | null>(null);
+  const [rankBoardRefreshKey, setRankBoardRefreshKey] = useState(0);
+  const [rankNotice, setRankNotice] = useState<{ visible: boolean; message: string }>({
+    visible: false,
+    message: ''
+  });
   const isAdmin = useMemo(() => currentUser?.username === 'lx', [currentUser]);
 
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -480,11 +514,56 @@ export default function App() {
     };
   }, [showWelcome]);
 
-  const openWelcome = useCallback((username: string) => {
+  const openWelcome = useCallback((username: string, rank?: string) => {
     setWelcomeUser(username);
+    setWelcomeRank(rank || null);
     setShowWelcome(true);
     setWelcomeFading(false);
   }, []);
+
+  const formatDuration = useCallback((totalSeconds: number) => {
+    if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return '0秒';
+    if (totalSeconds < 60) return `${totalSeconds}秒`;
+    return `${Math.floor(totalSeconds / 60)}分钟`;
+  }, []);
+
+  const getUserRankLabel = useCallback((user?: UserData | null) => {
+    return user?.rank || '士兵';
+  }, []);
+
+  const openRankNotice = useCallback((message: string) => {
+    setRankNotice({ visible: true, message });
+  }, []);
+
+  useEffect(() => {
+    if (!showRankBoard) return;
+    let active = true;
+    setRankBoardLoading(true);
+    setRankBoardError(null);
+    fetch(`${API_BASE}/users/leaderboard`)
+      .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load rank board failed: ${res.status}`)))
+      .then(data => {
+        if (!active) return;
+        const items = Array.isArray(data.items) ? data.items : [];
+        const normalized = items.map((item: any) => ({
+          username: String(item?.username || ''),
+          rank: item?.rank || '士兵',
+          totalSeconds: Number(item?.totalSeconds) || 0
+        }));
+        setRankBoard(normalized);
+      })
+      .catch(err => {
+        if (!active) return;
+        console.error('Rank board error:', err);
+        setRankBoardError('军衔榜加载失败，请稍后重试。');
+      })
+      .finally(() => {
+        if (active) setRankBoardLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showRankBoard, rankBoardRefreshKey]);
 
   useEffect(() => {
     let active = true;
@@ -506,6 +585,66 @@ export default function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let lastTick = Date.now();
+    let intervalId: number | null = null;
+
+    const handleVisibility = () => {
+      lastTick = Date.now();
+    };
+
+    const syncTime = async (deltaSeconds: number) => {
+      if (!currentUser.username || !currentUser.password || deltaSeconds <= 0) return;
+      try {
+        const res = await fetch(`${API_BASE}/users/heartbeat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: currentUser.username,
+            password: currentUser.password,
+            deltaSeconds
+          })
+        });
+        if (!res.ok) {
+          return;
+        }
+        const data = await res.json();
+        if (data?.rank || Number.isFinite(data?.totalSeconds)) {
+          setCurrentUser(prev => prev ? {
+            ...prev,
+            rank: data.rank ?? prev.rank,
+            totalSeconds: Number.isFinite(data.totalSeconds) ? data.totalSeconds : prev.totalSeconds
+          } : prev);
+        }
+        if (data?.upgraded && data?.fromRank && data?.toRank) {
+          const duration = formatDuration(Number(data.totalSeconds || 0));
+          openRankNotice(`${currentUser.username}${data.fromRank}，您在领航者空间站执行任务时长已达${duration}，军衔升至${data.toRank}`);
+        }
+      } catch (error) {
+        console.error('Rank sync error:', error);
+      }
+    };
+
+    intervalId = window.setInterval(() => {
+      if (document.hidden) {
+        lastTick = Date.now();
+        return;
+      }
+      const now = Date.now();
+      const deltaSeconds = Math.floor((now - lastTick) / 1000);
+      if (deltaSeconds <= 0) return;
+      lastTick = now;
+      void syncTime(deltaSeconds);
+    }, 5000);
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      if (intervalId) window.clearInterval(intervalId);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [currentUser, formatDuration, openRankNotice]);
 
   const toggleMusic = useCallback(() => {
     const audio = document.getElementById('bgm') as HTMLAudioElement;
@@ -700,14 +839,7 @@ export default function App() {
     if (!username || !password) return;
 
     const localUser = users.find(u => u.username === username);
-    if (localUser) {
-      if (localUser.password === password) {
-        setCurrentUser(localUser);
-        setShowAuth(false);
-        setAuthError(null);
-        openWelcome(localUser.username);
-        return;
-      }
+    if (localUser && localUser.password !== password) {
       setAuthError('密码输入错误');
       return;
     }
@@ -720,12 +852,23 @@ export default function App() {
       });
 
       if (loginRes.ok) {
-        const newUser = { username, password };
-        setUsers(prev => [...prev, newUser]);
+        const data = await loginRes.json();
+        const serverUser = data?.user || {};
+        const newUser: UserData = {
+          username,
+          password,
+          rank: serverUser.rank || localUser?.rank,
+          totalSeconds: Number.isFinite(serverUser.totalSeconds) ? serverUser.totalSeconds : localUser?.totalSeconds
+        };
+        setUsers(prev => {
+          const exists = prev.some(u => u.username === username);
+          if (!exists) return [...prev, newUser];
+          return prev.map(u => u.username === username ? { ...u, ...newUser } : u);
+        });
         setCurrentUser(newUser);
         setShowAuth(false);
         setAuthError(null);
-        openWelcome(newUser.username);
+        openWelcome(newUser.username, newUser.rank);
         return;
       }
 
@@ -838,7 +981,7 @@ export default function App() {
 
   return (
     <>
-      <MossChat username={currentUser?.username} />
+      <MossChat username={currentUser?.username} rank={getUserRankLabel(currentUser)} />
       <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen app-scale">
       
       {/* 全局确认弹窗 */}
@@ -860,12 +1003,15 @@ export default function App() {
           <button onClick={toggleMusic} className="p-2 border border-red-500/40 text-red-500 hover:text-white transition-colors">
             {isMusicPlaying ? <Volume2 size={20} /> : <VolumeX size={20} />}
           </button>
+          <CyberButton onClick={() => setShowRankBoard(true)} variant="secondary" className="px-3 py-2 text-xs">
+            军衔榜
+          </CyberButton>
           {currentUser ? (
             <div className="flex items-center gap-4">
               <div className="flex flex-col items-end">
                 <span className="text-[10px] text-red-900 uppercase font-mono tracking-tighter">Connected Node</span>
                 <span className="text-sm font-orbitron text-red-400 flex items-center gap-1">
-                  {isAdmin && <ShieldCheck size={14} className="text-red-600" />} {currentUser.username}
+                  {isAdmin && <ShieldCheck size={14} className="text-red-600" />} {currentUser.username}{getUserRankLabel(currentUser)}
                 </span>
               </div>
               {isAdmin && (
@@ -1063,12 +1209,104 @@ export default function App() {
             <div className="text-center space-y-4">
               <div className="w-16 h-16 bg-red-600 mx-auto flex items-center justify-center font-bold text-2xl text-white shadow-[0_0_20px_rgba(255,0,0,0.5)] uppercase font-orbitron">LX</div>
               <h2 className="text-2xl font-orbitron text-red-500 uppercase tracking-widest cyber-glow-red">欢迎回来</h2>
-              <p className="text-sm text-red-200/80 font-mono">欢迎回来，{welcomeUser}中校</p>
+              <p className="text-sm text-red-200/80 font-mono">欢迎回来，{welcomeUser}{welcomeRank || getUserRankLabel(currentUser)}</p>
             </div>
             <div className="pt-6">
               <CyberButton variant="secondary" className="w-full" onClick={() => setShowWelcome(false)}>
                 进入终端
               </CyberButton>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {rankNotice.visible && (
+        <div
+          className="fixed inset-0 z-[230] flex items-center justify-center bg-black/70 backdrop-blur-md p-4"
+        >
+          <div className="cyber-border-red bg-black w-full max-w-lg p-6 relative shadow-[0_0_40px_rgba(255,0,0,0.4)]">
+            <button
+              onClick={() => setRankNotice({ visible: false, message: '' })}
+              className="absolute top-4 right-4 text-red-500 hover:text-white"
+            >
+              <X size={20} />
+            </button>
+            <div className="flex items-center gap-3 text-red-500 mb-4">
+              <Zap size={18} />
+              <h2 className="text-lg font-orbitron font-bold tracking-widest uppercase">Rank Upgrade</h2>
+            </div>
+            <p className="text-sm text-red-200/90 font-mono leading-relaxed">
+              {rankNotice.message}
+            </p>
+            <div className="pt-6">
+              <CyberButton variant="secondary" className="w-full" onClick={() => setRankNotice({ visible: false, message: '' })}>
+                确认
+              </CyberButton>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRankBoard && (
+        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-in fade-in duration-300">
+          <div className="cyber-border-red bg-black w-full max-w-2xl p-6 relative shadow-[0_0_50px_rgba(255,0,0,0.3)]">
+            <button onClick={() => setShowRankBoard(false)} className="absolute -top-2 -right-2 text-red-500 hover:text-white"><X size={24}/></button>
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-orbitron text-red-500 uppercase tracking-widest flex items-center gap-2">
+                <ShieldCheck size={20} /> 军衔榜
+              </h2>
+              <CyberButton variant="secondary" onClick={() => setRankBoardRefreshKey(k => k + 1)} className="text-xs px-3 py-2">
+                刷新
+              </CyberButton>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-3">
+                <h3 className="text-xs font-orbitron text-red-400 uppercase tracking-widest">Ranking</h3>
+                <div className="border border-red-600/30 bg-black/40 p-3 min-h-[200px]">
+                  {rankBoardLoading && (
+                    <p className="text-xs text-red-400 font-mono">加载中...</p>
+                  )}
+                  {!rankBoardLoading && rankBoardError && (
+                    <p className="text-xs text-red-300 font-mono">{rankBoardError}</p>
+                  )}
+                  {!rankBoardLoading && !rankBoardError && rankBoard.length === 0 && (
+                    <p className="text-xs text-red-400 font-mono">暂无数据</p>
+                  )}
+                  {!rankBoardLoading && !rankBoardError && rankBoard.length > 0 && (
+                    <div className="space-y-2 text-xs text-red-200 font-mono">
+                      <div className="flex items-center justify-between text-[10px] text-red-500 border-b border-red-900/40 pb-1">
+                        <span className="w-6">#</span>
+                        <span className="flex-1 px-3">用户名</span>
+                        <span className="w-16 text-right">军衔</span>
+                        <span className="w-32 text-right">已执行任务</span>
+                      </div>
+                      {rankBoard.map((item, index) => (
+                        <div key={`${item.username}_${item.rank}`} className="flex items-center justify-between border-b border-red-900/40 pb-1">
+                          <span className="text-red-500 w-6">{index + 1}</span>
+                          <span className="flex-1 px-3">{item.username}</span>
+                          <span className="text-red-300 w-16 text-right">{item.rank}</span>
+                          <span className="text-red-600 w-32 text-right">已执行任务{item.totalSeconds}秒</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="space-y-3">
+                <h3 className="text-xs font-orbitron text-red-400 uppercase tracking-widest">Rank Guide</h3>
+                <div className="border border-red-600/30 bg-black/40 p-3 space-y-2 text-xs text-red-200 font-mono">
+                  {RANK_RULES.map((rule, index) => (
+                    <div key={rule.name} className="flex items-center justify-between border-b border-red-900/40 pb-1 last:border-b-0">
+                      <span>{rule.name}</span>
+                      <span>{index === 0 ? '初始' : `累计 ${formatDuration(rule.thresholdSeconds)}`}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] text-red-600 font-mono leading-relaxed">
+                  任务时长按登录后实际浏览时间累计，后台每 5 秒同步一次。
+                </p>
+              </div>
             </div>
           </div>
         </div>

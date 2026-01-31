@@ -34,6 +34,28 @@ const parseTags = (raw) => {
   return [];
 };
 
+const RANK_RULES = [
+  { name: "士兵", thresholdSeconds: 0 },
+  { name: "军士", thresholdSeconds: 30 },
+  { name: "少校", thresholdSeconds: 120 },
+  { name: "中校", thresholdSeconds: 300 },
+  { name: "大校", thresholdSeconds: 600 },
+  { name: "少将", thresholdSeconds: 1800 },
+  { name: "中将", thresholdSeconds: 3600 },
+  { name: "上将", thresholdSeconds: 7200 }
+];
+
+const resolveRank = (totalSeconds) => {
+  const safeSeconds = Math.max(0, Number(totalSeconds) || 0);
+  let current = RANK_RULES[0];
+  for (const rule of RANK_RULES) {
+    if (safeSeconds >= rule.thresholdSeconds) {
+      current = rule;
+    }
+  }
+  return current.name;
+};
+
 const mapPostRow = (row) => ({
   id: row.id,
   title: row.title,
@@ -69,8 +91,8 @@ const requireAdmin = async (req, res, next) => {
 
 const ensureAdminUser = async () => {
   await pool.query(
-    "INSERT INTO users (username, password, is_admin, created_at) VALUES (?, ?, 1, ?) ON DUPLICATE KEY UPDATE is_admin = 1",
-    ["lx", "123456", Date.now()]
+    "INSERT INTO users (username, password, is_admin, created_at, total_seconds, `rank`) VALUES (?, ?, 1, ?, 0, ?) ON DUPLICATE KEY UPDATE is_admin = 1",
+    ["lx", "123456", Date.now(), "士兵"]
   );
 };
 
@@ -89,7 +111,7 @@ app.post("/api/auth/login", async (req, res) => {
   }
 
   const [rows] = await pool.query(
-    "SELECT id, username, password, is_admin FROM users WHERE username = ? LIMIT 1",
+    "SELECT id, username, password, is_admin, total_seconds, `rank` FROM users WHERE username = ? LIMIT 1",
     [username]
   );
 
@@ -102,7 +124,22 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(401).json({ error: "Invalid password" });
   }
 
-  return res.json({ user: { id: user.id, username: user.username, isAdmin: Number(user.is_admin) === 1 } });
+  const totalSeconds = Number(user.total_seconds) || 0;
+  const computedRank = resolveRank(totalSeconds);
+  const storedRank = user.rank || computedRank;
+  if (storedRank !== computedRank) {
+    await pool.query("UPDATE users SET `rank` = ? WHERE id = ?", [computedRank, user.id]);
+  }
+
+  return res.json({
+    user: {
+      id: user.id,
+      username: user.username,
+      isAdmin: Number(user.is_admin) === 1,
+      rank: computedRank,
+      totalSeconds
+    }
+  });
 });
 
 app.post("/api/auth/register", async (req, res) => {
@@ -121,11 +158,63 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   const [result] = await pool.query(
-    "INSERT INTO users (username, password, is_admin, created_at) VALUES (?, ?, 0, ?)",
-    [username, password, Date.now()]
+    "INSERT INTO users (username, password, is_admin, created_at, total_seconds, `rank`) VALUES (?, ?, 0, ?, 0, ?)",
+    [username, password, Date.now(), "士兵"]
   );
 
-  return res.status(201).json({ user: { id: result.insertId, username, isAdmin: false } });
+  return res.status(201).json({ user: { id: result.insertId, username, isAdmin: false, rank: "士兵", totalSeconds: 0 } });
+});
+
+app.post("/api/users/heartbeat", async (req, res) => {
+  const { username, password, deltaSeconds } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: "Missing credentials" });
+  }
+
+  const delta = Math.max(0, Math.floor(Number(deltaSeconds) || 0));
+  if (delta <= 0) {
+    return res.json({ ok: true });
+  }
+
+  const [rows] = await pool.query(
+    "SELECT id, total_seconds, `rank` FROM users WHERE username = ? AND password = ? LIMIT 1",
+    [username, password]
+  );
+
+  if (!rows.length) {
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+
+  const user = rows[0];
+  const previousTotal = Number(user.total_seconds) || 0;
+  const previousRank = user.rank || resolveRank(previousTotal);
+  const nextTotal = previousTotal + delta;
+  const nextRank = resolveRank(nextTotal);
+
+  await pool.query(
+    "UPDATE users SET total_seconds = ?, `rank` = ? WHERE id = ?",
+    [nextTotal, nextRank, user.id]
+  );
+
+  return res.json({
+    totalSeconds: nextTotal,
+    rank: nextRank,
+    upgraded: previousRank !== nextRank,
+    fromRank: previousRank,
+    toRank: nextRank
+  });
+});
+
+app.get("/api/users/leaderboard", async (_req, res) => {
+  const [rows] = await pool.query(
+    "SELECT username, total_seconds, `rank` FROM users ORDER BY total_seconds DESC, username ASC"
+  );
+  const items = rows.map((row) => ({
+    username: row.username,
+    totalSeconds: Number(row.total_seconds) || 0,
+    rank: row.rank || resolveRank(row.total_seconds)
+  }));
+  return res.json({ items });
 });
 
 app.get("/api/posts", async (_req, res) => {
