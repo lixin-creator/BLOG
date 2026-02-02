@@ -441,6 +441,8 @@ export default function App() {
   const rocketFlameRef = useRef<HTMLDivElement | null>(null);
   const flameRafRef = useRef<number | null>(null);
   const flameStartRef = useRef<number | null>(null);
+  const [uptimeText, setUptimeText] = useState('');
+  const [onlineCount, setOnlineCount] = useState(1);
   
   // 用户与权限系统
   const [currentUser, setCurrentUser] = useState<UserData | null>(() => {
@@ -493,6 +495,7 @@ export default function App() {
     message: '',
     onConfirm: () => {},
   });
+  const tabIdRef = useRef<string>('');
   const modalOpen = showAuth || showWelcome || rankNotice.visible || showRankBoard || isEditorOpen || confirmModal.isOpen;
 
   // 同步到 LocalStorage
@@ -522,6 +525,99 @@ export default function App() {
     }
     document.body.classList.remove('modal-open');
   }, [modalOpen]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const start = new Date('2026-02-01T00:00:00');
+    const key = 'lx_station_online_map';
+    const now = Date.now();
+    if (!tabIdRef.current) {
+      const saved = sessionStorage.getItem('lx_tab_id');
+      tabIdRef.current = saved || `tab_${now}_${Math.random().toString(36).slice(2, 8)}`;
+      sessionStorage.setItem('lx_tab_id', tabIdRef.current);
+    }
+
+    const formatUptime = (ms: number) => {
+      const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+      const days = Math.floor(totalSeconds / 86400);
+      const hours = Math.floor((totalSeconds % 86400) / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      const years = totalSeconds / (365 * 24 * 3600);
+      const speedLyPerYear = 0.05;
+      const traveled = years * speedLyPerYear;
+      const totalDistance = 4;
+      const remaining = Math.max(0, totalDistance - traveled);
+      const traveledText = traveled.toFixed(4);
+      const remainingText = remaining.toFixed(4);
+      return `已稳定运行 ${days} 天 ${hours} 时 ${minutes} 分 ${seconds} 秒，累计行驶 ${traveledText} 光年，距离新家园还有 ${remainingText} 光年`;
+    };
+
+    const readMap = () => {
+      try {
+        const raw = localStorage.getItem(key);
+        const parsed = raw ? JSON.parse(raw) : {};
+        return typeof parsed === 'object' && parsed ? parsed : {};
+      } catch {
+        return {};
+      }
+    };
+
+    const writeMap = (next: Record<string, number>) => {
+      try {
+        localStorage.setItem(key, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+    };
+
+    const heartbeat = () => {
+      const map = readMap();
+      map[tabIdRef.current] = Date.now();
+      const cutoff = Date.now() - 20000;
+      Object.keys(map).forEach((id) => {
+        if (map[id] < cutoff) delete map[id];
+      });
+      writeMap(map);
+      setOnlineCount(Math.max(1, Object.keys(map).length));
+    };
+
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key !== key) return;
+      const map = readMap();
+      const cutoff = Date.now() - 20000;
+      Object.keys(map).forEach((id) => {
+        if (map[id] < cutoff) delete map[id];
+      });
+      setOnlineCount(Math.max(1, Object.keys(map).length));
+    };
+
+    const updateUptime = () => {
+      setUptimeText(formatUptime(Date.now() - start.getTime()));
+    };
+
+    const intervalId = window.setInterval(() => {
+      updateUptime();
+      heartbeat();
+    }, 1000);
+
+    updateUptime();
+    heartbeat();
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('beforeunload', () => {
+      const map = readMap();
+      delete map[tabIdRef.current];
+      writeMap(map);
+    });
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('storage', handleStorage);
+      const map = readMap();
+      delete map[tabIdRef.current];
+      writeMap(map);
+    };
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1401,6 +1497,12 @@ export default function App() {
         </div>
       )}
       <div className="max-w-6xl mx-auto px-4 py-8 relative min-h-screen app-scale">
+        <div className="mb-6">
+          <div className="cyber-border-red bg-black/50 px-4 py-3 text-[11px] font-mono text-red-300 flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+            <span>{uptimeText || '已稳定运行 0 天 0 时 0 分 0 秒'}</span>
+            <span>当前在港人数 {onlineCount} 人</span>
+          </div>
+        </div>
       
       {/* 头部 */}
       <header className="flex flex-col md:flex-row justify-between items-center mb-12 gap-6 pb-6 border-b border-red-500/30">
