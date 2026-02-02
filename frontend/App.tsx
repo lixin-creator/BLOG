@@ -39,7 +39,7 @@ import { synthesizeMossSpeech } from './services/ttsService';
 // 智谱克隆音色播报
 
 const COMMENTS_PER_PAGE = 5;
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
+const API_BASE = import.meta.env.VITE_API_BASE || "115.159.107.56:30001/api";
 const DEFAULT_COVER = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&q=80&w=800";
 
 // --- 类型扩展 ---
@@ -128,7 +128,7 @@ const CyberConfirmModal: React.FC<ConfirmModalConfig & { onClose: () => void }> 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/80 backdrop-blur-md animate-in fade-in duration-300">
+    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/80 backdrop-blur-md animate-in fade-in duration-300 modal-backdrop">
       <div className="w-full max-w-md p-1 bg-red-600 shadow-[0_0_30px_rgba(255,0,0,0.4)]">
         <div className="bg-black p-6 relative overflow-hidden">
           {/* 背景修饰 */}
@@ -423,7 +423,7 @@ const MossChat: React.FC<{ username?: string; rank?: string }> = ({ username, ra
             if (suppressClickRef.current) return;
             setIsOpen(true);
           }}
-          className="w-16 h-16 rounded-full moss-eye flex items-center justify-center border-2 border-red-600 animate-pulse group relative"
+          className="w-16 h-16 rounded-full moss-eye flex items-center justify-center border-2 border-red-600 animate-pulse group relative moss-drag-handle"
           onPointerDown={startDrag}
         >
           <div className="absolute inset-0 rounded-full border border-red-500 scale-125 opacity-20 group-hover:opacity-100 transition-opacity"></div>
@@ -438,6 +438,9 @@ const MossChat: React.FC<{ username?: string; rank?: string }> = ({ username, ra
 
 export default function App() {
   const [posts, setPosts] = useState<Post[]>([]);
+  const rocketFlameRef = useRef<HTMLDivElement | null>(null);
+  const flameRafRef = useRef<number | null>(null);
+  const flameStartRef = useRef<number | null>(null);
   
   // 用户与权限系统
   const [currentUser, setCurrentUser] = useState<UserData | null>(() => {
@@ -473,8 +476,15 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const [sortBy, setSortBy] = useState<SortOption>('newest');
   const [selectedPostId, setSelectedPostId] = useState<string | null>(null);
+  const [postDetailLoadingId, setPostDetailLoadingId] = useState<string | null>(null);
+  const [totalPages, setTotalPages] = useState(1);
+  const [searchKeyword, setSearchKeyword] = useState('');
+  const [allTags, setAllTags] = useState<string[]>([]);
+  const [postsRefreshKey, setPostsRefreshKey] = useState(0);
   const [isMusicPlaying, setIsMusicPlaying] = useState(false);
   const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null);
+  const [imageUploading, setImageUploading] = useState(false);
+  const [imageUploadError, setImageUploadError] = useState<string | null>(null);
 
   // 全局确认模态框状态
   const [confirmModal, setConfirmModal] = useState<ConfirmModalConfig>({
@@ -483,6 +493,7 @@ export default function App() {
     message: '',
     onConfirm: () => {},
   });
+  const modalOpen = showAuth || showWelcome || rankNotice.visible || showRankBoard || isEditorOpen || confirmModal.isOpen;
 
   // 同步到 LocalStorage
   useEffect(() => {
@@ -502,6 +513,111 @@ export default function App() {
       setAuthError(null);
     }
   }, [showAuth]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    if (modalOpen) {
+      document.body.classList.add('modal-open');
+      return;
+    }
+    document.body.classList.remove('modal-open');
+  }, [modalOpen]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const win: any = globalThis as any;
+    const canUse = win.matchMedia?.('(pointer: fine)')?.matches;
+    if (!canUse) return;
+    document.body.classList.add('rocket-cursor-enabled');
+
+    const updateFlamePos = (x: number, y: number) => {
+      const node = rocketFlameRef.current;
+      if (!node) return;
+      node.style.setProperty('--fx', `${x}px`);
+      node.style.setProperty('--fy', `${y}px`);
+    };
+
+    const animateFlame = () => {
+      const start = flameStartRef.current;
+      const node = rocketFlameRef.current;
+      if (!start || !node) return;
+      const elapsed = Math.max(0, performance.now() - start);
+      const maxMs = 900;
+      const minScale = 0.6;
+      const maxScale = 1.8;
+      const t = Math.min(1, elapsed / maxMs);
+      const scale = minScale + (maxScale - minScale) * t;
+      const flicker = 0.88 + Math.random() * 0.24;
+      const jitterX = (Math.random() - 0.5) * 4;
+      const jitterY = (Math.random() - 0.5) * 3;
+      node.style.setProperty('--flameScale', scale.toFixed(3));
+      node.style.setProperty('--flameOpacity', flicker.toFixed(3));
+      node.style.setProperty('--flameJx', `${jitterX.toFixed(2)}px`);
+      node.style.setProperty('--flameJy', `${jitterY.toFixed(2)}px`);
+      flameRafRef.current = win.requestAnimationFrame(animateFlame);
+    };
+
+    const handleMove = (e: PointerEvent | MouseEvent) => {
+      updateFlamePos(e.clientX, e.clientY);
+    };
+    const handleDown = (e: PointerEvent | MouseEvent) => {
+      document.body.classList.add('rocket-firing');
+      flameStartRef.current = performance.now();
+      updateFlamePos(e.clientX, e.clientY);
+      if (!flameRafRef.current) {
+        flameRafRef.current = win.requestAnimationFrame(animateFlame);
+      }
+    };
+    const stopFlame = () => {
+      document.body.classList.remove('rocket-firing');
+      flameStartRef.current = null;
+      if (flameRafRef.current) {
+        win.cancelAnimationFrame(flameRafRef.current);
+        flameRafRef.current = null;
+      }
+      const node = rocketFlameRef.current;
+      if (node) {
+        node.style.setProperty('--flameScale', '0');
+        node.style.setProperty('--flameOpacity', '0');
+        node.style.setProperty('--flameJx', '0px');
+        node.style.setProperty('--flameJy', '0px');
+      }
+    };
+    const handleUp = () => stopFlame();
+    const handleLeave = () => stopFlame();
+    const handleBlur = () => stopFlame();
+
+    win.addEventListener('pointermove', handleMove, { passive: true });
+    if ('onpointerrawupdate' in win) {
+      win.addEventListener('pointerrawupdate', handleMove as EventListener, { passive: true });
+    } else {
+      win.addEventListener('mousemove', handleMove, { passive: true });
+    }
+    win.addEventListener('pointerdown', handleDown);
+    win.addEventListener('pointerup', handleUp);
+    win.addEventListener('mouseleave', handleLeave);
+    win.addEventListener('blur', handleBlur);
+
+    return () => {
+      document.body.classList.remove('rocket-cursor-enabled');
+      document.body.classList.remove('rocket-firing');
+      flameStartRef.current = null;
+      if (flameRafRef.current) {
+        win.cancelAnimationFrame(flameRafRef.current);
+        flameRafRef.current = null;
+      }
+      win.removeEventListener('pointermove', handleMove);
+      if ('onpointerrawupdate' in win) {
+        win.removeEventListener('pointerrawupdate', handleMove as EventListener);
+      } else {
+        win.removeEventListener('mousemove', handleMove as EventListener);
+      }
+      win.removeEventListener('pointerdown', handleDown);
+      win.removeEventListener('pointerup', handleUp);
+      win.removeEventListener('mouseleave', handleLeave);
+      win.removeEventListener('blur', handleBlur);
+    };
+  }, []);
 
   useEffect(() => {
     if (!showWelcome) return;
@@ -567,15 +683,55 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
+    fetch(`${API_BASE}/tags`)
+      .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load tags failed: ${res.status}`)))
+      .then(data => {
+        if (!active) return;
+        const tags = Array.isArray(data.tags) ? data.tags : [];
+        setAllTags(tags);
+      })
+      .catch(err => console.error('Load tags error:', err));
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = window.setTimeout(() => {
+      setSearchKeyword(searchQuery.trim());
+      setCurrentPage(1);
+    }, 300);
+    return () => window.clearTimeout(handler);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedTag, sortBy]);
+
+  useEffect(() => {
+    let active = true;
     (async () => {
       try {
-        const res = await fetch(`${API_BASE}/posts`);
+        const params = new URLSearchParams();
+        params.set('summary', '1');
+        params.set('page', String(currentPage));
+        params.set('pageSize', String(POSTS_PER_PAGE));
+        params.set('sort', sortBy);
+        if (searchKeyword) params.set('search', searchKeyword);
+        if (selectedTag) params.set('tag', selectedTag);
+        const res = await fetch(`${API_BASE}/posts?${params.toString()}`);
         if (!res.ok) {
           throw new Error(`Load posts failed: ${res.status}`);
         }
         const data = await res.json();
         if (active) {
           setPosts(Array.isArray(data.posts) ? data.posts : []);
+          const total = Number(data.total || 0);
+          const nextTotalPages = Math.max(1, Math.ceil(total / POSTS_PER_PAGE));
+          setTotalPages(nextTotalPages);
+          if (currentPage > nextTotalPages) {
+            setCurrentPage(nextTotalPages);
+          }
         }
       } catch (error) {
         console.error('Load posts error:', error);
@@ -584,7 +740,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [currentPage, sortBy, selectedTag, searchKeyword, postsRefreshKey]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -656,36 +812,7 @@ export default function App() {
     setIsMusicPlaying(!isMusicPlaying);
   }, [isMusicPlaying]);
 
-  const allTags = useMemo(() => {
-    const tags = new Set<string>();
-    posts.forEach(p => p.tags.forEach(t => tags.add(t)));
-    return Array.from(tags);
-  }, [posts]);
-
-  const filteredPosts = useMemo(() => {
-    let result = [...posts].filter(post => {
-      const matchesSearch = post.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                          post.content.toLowerCase().includes(searchQuery.toLowerCase());
-      const matchesTag = !selectedTag || post.tags.includes(selectedTag);
-      return matchesSearch && matchesTag;
-    });
-
-    result.sort((a, b) => {
-      if (sortBy === 'newest') return b.createdAt - a.createdAt;
-      if (sortBy === 'oldest') return a.createdAt - b.createdAt;
-      if (sortBy === 'likes') return b.likes - a.likes;
-      if (sortBy === 'views') return b.views - a.views;
-      return 0;
-    });
-
-    return result;
-  }, [posts, searchQuery, selectedTag, sortBy]);
-
-  const totalPages = Math.ceil(filteredPosts.length / POSTS_PER_PAGE);
-  const paginatedPosts = useMemo(() => filteredPosts.slice(
-    (currentPage - 1) * POSTS_PER_PAGE,
-    currentPage * POSTS_PER_PAGE
-  ), [filteredPosts, currentPage]);
+  const paginatedPosts = posts;
 
   const handleLike = useCallback(async (id: string) => {
     if (!currentUser) {
@@ -728,12 +855,26 @@ export default function App() {
     });
   };
 
+  const uploadImage = useCallback(async (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/uploads`, {
+      method: 'POST',
+      body: formData
+    });
+    if (!res.ok) {
+      throw new Error(`Upload failed: ${res.status}`);
+    }
+    const data = await res.json();
+    return data.url as string;
+  }, []);
+
   const handleAddComment = useCallback(async (postId: string, comment: string, imageUrl?: string) => {
     if (!currentUser) {
       setShowAuth(true);
-      return;
+      return false;
     }
-    if (!comment.trim() && !imageUrl) return;
+    if (!comment.trim() && !imageUrl) return false;
     const dungeon = await fetchDungeonLocation();
     try {
       const res = await fetch(`${API_BASE}/posts/${postId}/comments`, {
@@ -742,25 +883,29 @@ export default function App() {
         body: JSON.stringify({
           author: currentUser.username,
           content: comment,
-          imageBase64: imageUrl || null,
+          imageUrl: imageUrl || null,
           location: dungeon
         })
       });
       if (!res.ok) {
         throw new Error(`Add comment failed: ${res.status}`);
       }
-      const data = await res.json();
-      const newComment = data.comment;
-      setPosts(prev => prev.map(p => p.id === postId ? { ...p, comments: [newComment, ...p.comments] } : p));
+      await res.json();
+      setPosts(prev => prev.map(p => p.id === postId ? {
+        ...p,
+        commentCount: (p.commentCount ?? p.comments.length) + 1
+      } : p));
+      return true;
     } catch (error) {
       console.error('Add Comment Error:', error);
+      return false;
     }
   }, [currentUser]);
 
   const handleLikeComment = useCallback(async (postId: string, commentId: string) => {
     if (!currentUser) {
       setShowAuth(true);
-      return;
+      return null;
     }
     try {
       const res = await fetch(`${API_BASE}/comments/${commentId}/like`, { method: 'POST' });
@@ -773,36 +918,46 @@ export default function App() {
           ? { ...p, comments: p.comments.map(c => c.id === commentId ? { ...c, likes: data.likes ?? c.likes } : c) }
           : p
       ));
+      return Number.isFinite(data?.likes) ? data.likes : null;
     } catch (error) {
       console.error('Like Comment Error:', error);
+      return null;
     }
   }, [currentUser]);
 
   const handleDeleteComment = useCallback((postId: string, commentId: string) => {
-    if (!isAdmin || !currentUser) return;
-    setConfirmModal({
-      isOpen: true,
-      title: 'MOSS WARNING: DELETE COMMENT',
-      message: 'Confirm delete this comment?',
-      onConfirm: async () => {
-        try {
-          const res = await fetch(`${API_BASE}/posts/${postId}/comments/${commentId}`, {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
-          });
-          if (!res.ok) {
-            throw new Error(`Delete comment failed: ${res.status}`);
+    if (!isAdmin || !currentUser) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      setConfirmModal({
+        isOpen: true,
+        title: 'MOSS WARNING: DELETE COMMENT',
+        message: 'Confirm delete this comment?',
+        onConfirm: async () => {
+          try {
+            const res = await fetch(`${API_BASE}/posts/${postId}/comments/${commentId}`, {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
+            });
+            if (!res.ok) {
+              throw new Error(`Delete comment failed: ${res.status}`);
+            }
+            setPosts(prev => prev.map(p =>
+              p.id === postId
+                ? {
+                    ...p,
+                    comments: p.comments.filter(c => c.id !== commentId),
+                    commentCount: Math.max(0, (p.commentCount ?? p.comments.length) - 1)
+                  }
+                : p
+            ));
+            resolve(true);
+          } catch (error) {
+            console.error('Delete Comment Error:', error);
+            resolve(false);
           }
-          setPosts(prev => prev.map(p =>
-            p.id === postId
-              ? { ...p, comments: p.comments.filter(c => c.id !== commentId) }
-              : p
-          ));
-        } catch (error) {
-          console.error('Delete Comment Error:', error);
         }
-      }
+      });
     });
   }, [isAdmin, currentUser]);
 
@@ -824,6 +979,7 @@ export default function App() {
           }
           setPosts(currentPosts => currentPosts.filter(p => p.id !== id));
           if (selectedPostId === id) setSelectedPostId(null);
+          setPostsRefreshKey(key => key + 1);
         } catch (error) {
           console.error('Delete Post Error:', error);
         }
@@ -889,12 +1045,20 @@ export default function App() {
     }
   };
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => setUploadedImageUrl(reader.result as string);
-      reader.readAsDataURL(file);
+      setImageUploading(true);
+      setImageUploadError(null);
+      try {
+        const url = await uploadImage(file);
+        setUploadedImageUrl(url);
+      } catch (error) {
+        console.error('Upload image error:', error);
+        setImageUploadError('图片上传失败，请稍后重试。');
+      } finally {
+        setImageUploading(false);
+      }
     }
   };
 
@@ -922,7 +1086,7 @@ export default function App() {
             content,
             excerpt: finalExcerpt,
             tags,
-            imageBase64: currentImage,
+            imageUrl: currentImage,
             username: currentUser.username,
             password: currentUser.password
           })
@@ -933,6 +1097,8 @@ export default function App() {
         setPosts(prev => prev.map(p => p.id === editingPost.id ? {
           ...p, title, content, tags, excerpt: finalExcerpt, imageUrl: currentImage
         } : p));
+        setAllTags(prev => Array.from(new Set([...prev, ...tags])));
+        setPostsRefreshKey(key => key + 1);
       } else {
         const res = await fetch(`${API_BASE}/posts`, {
           method: 'POST',
@@ -943,7 +1109,7 @@ export default function App() {
             excerpt: finalExcerpt,
             author: currentUser.username,
             tags,
-            imageBase64: currentImage,
+            imageUrl: currentImage,
             username: currentUser.username,
             password: currentUser.password
           })
@@ -953,7 +1119,9 @@ export default function App() {
         }
         const data = await res.json();
         const newPost = data.post;
-        setPosts(prev => [newPost, ...prev]);
+        setPosts(prev => [{ ...newPost, commentCount: 0 }, ...prev]);
+        setAllTags(prev => Array.from(new Set([...prev, ...tags])));
+        setPostsRefreshKey(key => key + 1);
       }
     } catch (error) {
       console.error('Save Post Error:', error);
@@ -974,13 +1142,34 @@ export default function App() {
         setPosts(prev => prev.map(p => p.id === id ? { ...p, views: data.views ?? p.views } : p));
       })
       .catch(err => console.error('View Error:', err));
+
+    const target = posts.find(p => p.id === id);
+    const needsDetail = !target || !target.content;
+    if (needsDetail) {
+      setPostDetailLoadingId(id);
+      fetch(`${API_BASE}/posts/${id}`)
+        .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load post failed: ${res.status}`)))
+        .then(data => {
+          const fullPost = data?.post;
+          if (!fullPost) return;
+          setPosts(prev => {
+            const exists = prev.some(p => p.id === id);
+            if (!exists) return [fullPost, ...prev];
+            return prev.map(p => p.id === id ? { ...p, ...fullPost } : p);
+          });
+        })
+        .catch(err => console.error('Load post detail error:', err))
+        .finally(() => setPostDetailLoadingId(current => current === id ? null : current));
+    }
+
     window.scrollTo({ top: 0, behavior: 'smooth' });
-  }, []);
+  }, [posts]);
 
   const currentPost = useMemo(() => posts.find(p => p.id === selectedPostId), [posts, selectedPostId]);
 
   return (
     <>
+      <div ref={rocketFlameRef} className="rocket-flame" aria-hidden="true" />
       <MossChat username={currentUser?.username} rank={getUserRankLabel(currentUser)} />
       {/* 全局确认弹窗 */}
       <CyberConfirmModal 
@@ -989,7 +1178,7 @@ export default function App() {
       />
 
       {showAuth && (
-        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-md p-4 animate-in fade-in zoom-in-95 duration-300">
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/95 backdrop-blur-md p-4 animate-in fade-in zoom-in-95 duration-300 modal-backdrop">
           <div className="cyber-border-red bg-black w-full max-w-md p-8 relative shadow-[0_0_50px_rgba(255,0,0,0.3)]">
             <button onClick={() => setShowAuth(false)} className="absolute top-4 right-4 text-red-500 hover:text-white"><X size={24}/></button>
             <div className="text-center mb-8">
@@ -1034,7 +1223,7 @@ export default function App() {
 
       {showWelcome && welcomeUser && (
         <div
-          className={`fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 ${welcomeFading ? 'opacity-0 transition-opacity duration-700' : 'opacity-100'}`}
+          className={`fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 ${welcomeFading ? 'opacity-0 transition-opacity duration-700' : 'opacity-100'} modal-backdrop`}
         >
           <div className="cyber-border-red bg-black w-full max-w-md p-8 relative shadow-[0_0_50px_rgba(255,0,0,0.3)]">
             <button
@@ -1059,7 +1248,7 @@ export default function App() {
 
       {rankNotice.visible && (
         <div
-          className="fixed inset-0 z-[230] flex items-center justify-center bg-black/70 backdrop-blur-md p-4"
+          className="fixed inset-0 z-[230] flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop"
         >
           <div className="cyber-border-red bg-black w-full max-w-lg p-6 relative shadow-[0_0_40px_rgba(255,0,0,0.4)]">
             <button
@@ -1085,7 +1274,7 @@ export default function App() {
       )}
 
       {showRankBoard && (
-        <div className="fixed inset-0 z-[210] flex items-start sm:items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-in fade-in duration-300">
+        <div className="fixed inset-0 z-[210] flex items-start sm:items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-in fade-in duration-300 modal-backdrop">
           <div className="cyber-border-red bg-black w-full max-w-2xl p-6 pt-10 relative shadow-[0_0_50px_rgba(255,0,0,0.3)] max-h-[calc(100vh-2rem)] overflow-y-auto">
             <button
               onClick={() => setShowRankBoard(false)}
@@ -1156,7 +1345,7 @@ export default function App() {
       )}
 
       {isEditorOpen && isAdmin && (
-        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/95 backdrop-blur-sm p-4 animate-in fade-in duration-300">
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/95 backdrop-blur-sm p-4 animate-in fade-in duration-300 modal-backdrop">
           <div className="cyber-border-red bg-black w-full max-w-2xl p-6 relative max-h-[90vh] overflow-y-auto shadow-2xl">
             <h2 className="text-xl font-orbitron text-red-500 mb-6 flex items-center gap-2 uppercase tracking-widest"><Cpu className="w-5 h-5" /> {editingPost ? '修订广播内容' : '发起系统广播'}</h2>
             <form onSubmit={handleSavePost} className="space-y-4">
@@ -1177,8 +1366,8 @@ export default function App() {
                 <div className="flex items-center gap-3">
                   <label className="cursor-pointer text-red-500 hover:text-white transition-colors flex items-center gap-2 text-xs font-mono uppercase">
                     <Upload size={16} />
-                    <span>上传封面</span>
-                    <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
+                    <span>{imageUploading ? '上传中...' : '上传封面'}</span>
+                    <input type="file" accept="image/*" onChange={handleImageUpload} className="hidden" disabled={imageUploading} />
                   </label>
                   {(uploadedImageUrl || editingPost?.imageUrl) && (
                     <button
@@ -1190,6 +1379,9 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                {imageUploadError && (
+                  <div className="text-[10px] text-orange-500 font-mono mt-2">{imageUploadError}</div>
+                )}
                 {(uploadedImageUrl || editingPost?.imageUrl) && (
                   <div className="mt-3 border border-red-500/20 bg-black/40 p-2">
                     <img
@@ -1315,22 +1507,29 @@ export default function App() {
         </aside>
 
         <main className="lg:col-span-3 order-1 lg:order-2 space-y-6">
-          {selectedPostId && currentPost ? (
-            <PostDetail 
-              post={currentPost}
-              onBack={() => setSelectedPostId(null)}
-              onLike={() => handleLike(selectedPostId)}
-              onAddComment={(msg, img) => handleAddComment(selectedPostId, msg, img)}
-              onLikeComment={(commentId) => handleLikeComment(selectedPostId, commentId)}
-              onDeleteComment={(commentId) => handleDeleteComment(selectedPostId, commentId)}
-              isAdmin={isAdmin}
-              onDelete={() => handleDeletePost(selectedPostId)}
-              onEdit={() => { 
-                setEditingPost(currentPost); 
-                setUploadedImageUrl(null);
-                setIsEditorOpen(true); 
-              }}
-            />
+          {selectedPostId ? (
+            currentPost && postDetailLoadingId !== selectedPostId ? (
+              <PostDetail 
+                post={currentPost}
+                onBack={() => setSelectedPostId(null)}
+                onLike={() => handleLike(selectedPostId)}
+                onAddComment={(msg, img) => handleAddComment(selectedPostId, msg, img)}
+                onLikeComment={(commentId) => handleLikeComment(selectedPostId, commentId)}
+                onDeleteComment={(commentId) => handleDeleteComment(selectedPostId, commentId)}
+                isAdmin={isAdmin}
+                onDelete={() => handleDeletePost(selectedPostId)}
+                onEdit={() => { 
+                  setEditingPost(currentPost); 
+                  setUploadedImageUrl(null);
+                  setIsEditorOpen(true); 
+                }}
+                onUploadImage={uploadImage}
+              />
+            ) : (
+              <div className="cyber-border-red bg-black/40 p-8 text-center text-red-500 font-orbitron uppercase tracking-widest">
+                Loading Data Sector...
+              </div>
+            )
           ) : (
             <>
               <div className="space-y-6">
@@ -1409,7 +1608,7 @@ const ArticleCard = React.memo<{
           <span className="flex items-center gap-1"><Clock size={12} /> {new Date(post.createdAt).toLocaleDateString()}</span>
           <span className="flex items-center gap-1"><Eye size={12} /> {post.views}</span>
           <span className="flex items-center gap-1 text-red-600"><Heart size={12} className="fill-current" /> {post.likes}</span>
-          <span className="flex items-center gap-1"><MessageSquare size={12} /> {post.comments.length}</span>
+          <span className="flex items-center gap-1"><MessageSquare size={12} /> {post.commentCount ?? post.comments.length}</span>
         </div>
         <span className="text-red-500 font-orbitron group-hover:underline tracking-tighter uppercase">Read Data Sector &gt;</span>
       </div>
@@ -1421,32 +1620,104 @@ const PostDetail = React.memo<{
   post: Post; 
   onBack: () => void; 
   onLike: () => void; 
-  onAddComment: (msg: string, img?: string) => void; 
-  onLikeComment: (commentId: string) => void;
-  onDeleteComment: (commentId: string) => void;
+  onAddComment: (msg: string, img?: string) => Promise<boolean>; 
+  onLikeComment: (commentId: string) => Promise<number | null>;
+  onDeleteComment: (commentId: string) => Promise<boolean>;
   isAdmin: boolean; 
   onDelete: () => void; 
   onEdit: () => void; 
-}>(({ post, onBack, onLike, onAddComment, onLikeComment, onDeleteComment, isAdmin, onDelete, onEdit }) => {
+  onUploadImage: (file: File) => Promise<string>;
+}>(({ post, onBack, onLike, onAddComment, onLikeComment, onDeleteComment, isAdmin, onDelete, onEdit, onUploadImage }) => {
   const [commentText, setCommentText] = useState('');
   const [commentPage, setCommentPage] = useState(1);
   const [commentImg, setCommentImg] = useState<string | null>(null);
-  const totalCommentPages = Math.ceil(post.comments.length / COMMENTS_PER_PAGE);
-  const paginatedComments = useMemo(() => {
-    const sortedComments = [...post.comments].sort((a, b) => b.createdAt - a.createdAt);
-    return sortedComments.slice((commentPage - 1) * COMMENTS_PER_PAGE, commentPage * COMMENTS_PER_PAGE);
-  }, [post.comments, commentPage]);
+  const [commentImgUploading, setCommentImgUploading] = useState(false);
+  const [commentImgError, setCommentImgError] = useState<string | null>(null);
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [commentTotal, setCommentTotal] = useState(0);
+  const [commentLoading, setCommentLoading] = useState(false);
+  const [commentRefreshKey, setCommentRefreshKey] = useState(0);
+  const totalCommentPages = Math.max(1, Math.ceil(commentTotal / COMMENTS_PER_PAGE));
+
+  useEffect(() => {
+    setCommentPage(1);
+    setComments([]);
+    setCommentTotal(0);
+  }, [post.id]);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      setCommentLoading(true);
+      try {
+        const params = new URLSearchParams();
+        params.set('page', String(commentPage));
+        params.set('pageSize', String(COMMENTS_PER_PAGE));
+        const res = await fetch(`${API_BASE}/posts/${post.id}/comments?${params.toString()}`);
+        if (!res.ok) {
+          throw new Error(`Load comments failed: ${res.status}`);
+        }
+        const data = await res.json();
+        if (!active) return;
+        const total = Number(data.total || 0);
+        setCommentTotal(total);
+        const nextTotalPages = Math.max(1, Math.ceil(total / COMMENTS_PER_PAGE));
+        if (commentPage > nextTotalPages) {
+          setCommentPage(nextTotalPages);
+          return;
+        }
+        setComments(Array.isArray(data.comments) ? data.comments : []);
+      } catch (error) {
+        console.error('Load comments error:', error);
+      } finally {
+        if (active) setCommentLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [post.id, commentPage, commentRefreshKey]);
 
   const handleNextCommentPage = () => setCommentPage(p => Math.min(totalCommentPages, p + 1));
   const handlePrevCommentPage = () => setCommentPage(p => Math.max(1, p - 1));
 
-  const handleCommentImgUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleCommentImgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => setCommentImg(reader.result as string);
-      reader.readAsDataURL(file);
+      setCommentImgUploading(true);
+      setCommentImgError(null);
+      try {
+        const url = await onUploadImage(file);
+        setCommentImg(url);
+      } catch (error) {
+        console.error('Upload comment image error:', error);
+        setCommentImgError('图片上传失败，请稍后重试。');
+      } finally {
+        setCommentImgUploading(false);
+      }
     }
+  };
+
+  const handleSubmitComment = async () => {
+    if (commentImgUploading) return;
+    const ok = await onAddComment(commentText, commentImg || undefined);
+    if (!ok) return;
+    setCommentText('');
+    setCommentImg(null);
+    setCommentPage(1);
+    setCommentRefreshKey(key => key + 1);
+  };
+
+  const handleLikeCommentLocal = async (commentId: string) => {
+    const likes = await onLikeComment(commentId);
+    if (!Number.isFinite(likes)) return;
+    setComments(prev => prev.map(c => c.id === commentId ? { ...c, likes: likes as number } : c));
+  };
+
+  const handleDeleteCommentLocal = async (commentId: string) => {
+    const ok = await onDeleteComment(commentId);
+    if (!ok) return;
+    setCommentRefreshKey(key => key + 1);
   };
 
   const formatDateFull = (ts: number) => {
@@ -1499,28 +1770,33 @@ const PostDetail = React.memo<{
           )}
           <div className="flex justify-between items-center">
             <label className="cursor-pointer text-red-500 hover:text-white transition-colors flex items-center gap-2">
-              <ImageIcon size={18}/><span className="text-xs font-mono uppercase">Add Visual Data</span>
-              <input type="file" accept="image/*" onChange={handleCommentImgUpload} className="hidden" />
+              <ImageIcon size={18}/><span className="text-xs font-mono uppercase">{commentImgUploading ? '上传中...' : 'Add Visual Data'}</span>
+              <input type="file" accept="image/*" onChange={handleCommentImgUpload} className="hidden" disabled={commentImgUploading} />
             </label>
-            <CyberButton onClick={() => { onAddComment(commentText, commentImg || undefined); setCommentText(''); setCommentImg(null); setCommentPage(1); }} variant="moss">广播应答</CyberButton>
+            <CyberButton onClick={handleSubmitComment} variant="moss" disabled={commentImgUploading}>广播应答</CyberButton>
           </div>
+          {commentImgError && (
+            <div className="mt-2 text-[10px] text-orange-500 font-mono">{commentImgError}</div>
+          )}
         </div>
         <div className="space-y-4">
-          {paginatedComments.length > 0 ? (
+          {commentLoading ? (
+            <div className="text-center py-8 text-red-600 font-mono text-xs italic border border-dashed border-red-900/30 uppercase tracking-widest">Loading...</div>
+          ) : comments.length > 0 ? (
             <>
-              {paginatedComments.map(c => (
+              {comments.map(c => (
                 <div key={c.id} className="cyber-border-red p-4 bg-red-900/10 border-l-2 border-l-red-500 animate-in slide-in-from-left duration-300 group">
                   <div className="flex justify-between mb-2 text-[10px] font-orbitron text-red-500">
                     <span className="flex items-center gap-2">{c.author} {c.location && <span className="text-red-700 flex items-center gap-1"><MapPin size={10}/> {c.location}</span>}</span>
                     <div className="flex items-center gap-4">
                       <span>{formatDateFull(c.createdAt)}</span>
-                      {isAdmin && <button onClick={() => onDeleteComment(c.id)} className="text-orange-600 hover:text-orange-400 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={12}/></button>}
+                      {isAdmin && <button onClick={() => handleDeleteCommentLocal(c.id)} className="text-orange-600 hover:text-orange-400 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={12}/></button>}
                     </div>
                   </div>
                   <p className="text-sm text-red-100/80 font-mono mb-3">{c.content}</p>
                   {c.imageUrl && <div className="mb-3 max-w-sm border border-red-500/10"><img src={c.imageUrl} className="w-full h-auto grayscale opacity-80" alt="Attachment" /></div>}
                   <div className="flex items-center gap-4">
-                    <button onClick={() => onLikeComment(c.id)} className="flex items-center gap-1 text-[10px] font-mono text-red-900 hover:text-red-500 transition-colors">
+                    <button onClick={() => handleLikeCommentLocal(c.id)} className="flex items-center gap-1 text-[10px] font-mono text-red-900 hover:text-red-500 transition-colors">
                       <ThumbsUp size={12} className={c.likes > 0 ? "text-red-500" : ""}/> {c.likes}
                     </button>
                   </div>

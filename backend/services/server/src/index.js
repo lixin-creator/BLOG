@@ -2,12 +2,21 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import mysql from "mysql2/promise";
+import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
+import multer from "multer";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
+app.set("trust proxy", true);
+
+const uploadDir = path.resolve(process.cwd(), "uploads");
+fs.mkdirSync(uploadDir, { recursive: true });
+app.use("/uploads", express.static(uploadDir));
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "127.0.0.1",
@@ -70,6 +79,73 @@ const mapPostRow = (row) => ({
   imageUrl: row.image_base64 || null
 });
 
+const mapPostSummaryRow = (row) => ({
+  id: row.id,
+  title: row.title,
+  content: "",
+  excerpt: row.excerpt,
+  author: row.author,
+  createdAt: Number(row.created_at),
+  tags: parseTags(row.tags),
+  likes: Number(row.likes),
+  views: Number(row.views),
+  comments: [],
+  commentCount: Number(row.comment_count) || 0,
+  imageUrl: row.image_base64 || null
+});
+
+const ALLOWED_IMAGE_MIME = new Map([
+  ["image/jpeg", "jpg"],
+  ["image/png", "png"],
+  ["image/webp", "webp"],
+  ["image/gif", "gif"]
+]);
+
+const buildPublicUrl = (req, filename) => {
+  const host = req.get("host");
+  const protocol = req.protocol || "http";
+  return `${protocol}://${host}/uploads/${filename}`;
+};
+
+const saveBase64Image = (req, dataUrl) => {
+  if (!dataUrl || typeof dataUrl !== "string") return null;
+  if (!dataUrl.startsWith("data:image/")) return dataUrl;
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+  const mime = match[1];
+  const ext = ALLOWED_IMAGE_MIME.get(mime) || "png";
+  const filename = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const buffer = Buffer.from(match[2], "base64");
+  fs.writeFileSync(path.join(uploadDir, filename), buffer);
+  return buildPublicUrl(req, filename);
+};
+
+const resolveImageUrl = (req, imageUrl, imageBase64) => {
+  if (imageUrl) return imageUrl;
+  if (imageBase64) return saveBase64Image(req, imageBase64);
+  return null;
+};
+
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const ext = ALLOWED_IMAGE_MIME.get(file.mimetype) || "png";
+    cb(null, `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`);
+  }
+});
+
+const upload = multer({
+  storage: uploadStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_IMAGE_MIME.has(file.mimetype)) {
+      cb(new Error("Unsupported image type"));
+      return;
+    }
+    cb(null, true);
+  }
+});
+
 const requireAdmin = async (req, res, next) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
@@ -102,6 +178,24 @@ const ttsCache = new Map();
 
 app.get("/api/health", async (_req, res) => {
   res.json({ status: "ok" });
+});
+
+app.get("/api/tags", async (_req, res) => {
+  const [rows] = await pool.query("SELECT tags FROM posts");
+  const tagSet = new Set();
+  for (const row of rows) {
+    const tags = parseTags(row.tags);
+    tags.forEach((t) => tagSet.add(t));
+  }
+  return res.json({ tags: Array.from(tagSet) });
+});
+
+app.post("/api/uploads", upload.single("file"), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: "Missing file" });
+  }
+  const url = buildPublicUrl(req, req.file.filename);
+  return res.status(201).json({ url });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -217,7 +311,52 @@ app.get("/api/users/leaderboard", async (_req, res) => {
   return res.json({ items });
 });
 
-app.get("/api/posts", async (_req, res) => {
+app.get("/api/posts", async (req, res) => {
+  const summary = String(req.query.summary || "") === "1";
+
+  if (summary) {
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize || 10)));
+    const sort = String(req.query.sort || "newest");
+    const search = String(req.query.search || "").trim();
+    const tag = String(req.query.tag || "").trim();
+
+    const sortMap = new Map([
+      ["newest", "p.created_at DESC"],
+      ["oldest", "p.created_at ASC"],
+      ["likes", "p.likes DESC"],
+      ["views", "p.views DESC"]
+    ]);
+    const orderBy = sortMap.get(sort) || sortMap.get("newest");
+
+    const whereParts = [];
+    const params = [];
+    if (search) {
+      whereParts.push("(p.title LIKE ? OR p.excerpt LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like);
+    }
+    if (tag) {
+      whereParts.push("p.tags LIKE ?");
+      params.push(`%${tag}%`);
+    }
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM posts p ${whereSql}`,
+      params
+    );
+    const total = Number(countRows[0]?.total || 0);
+    const offset = (page - 1) * pageSize;
+
+    const [postRows] = await pool.query(
+      `SELECT p.id, p.title, p.excerpt, p.author, p.created_at, p.tags, p.likes, p.views, p.image_base64, COALESCE(c.comment_count, 0) AS comment_count FROM posts p LEFT JOIN (SELECT post_id, COUNT(*) AS comment_count FROM comments GROUP BY post_id) c ON c.post_id = p.id ${whereSql} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset]
+    );
+    const posts = postRows.map(mapPostSummaryRow);
+    return res.json({ posts, page, pageSize, total });
+  }
+
   const [postRows] = await pool.query(
     "SELECT id, title, content, excerpt, author, created_at, tags, likes, views, image_base64 FROM posts ORDER BY created_at DESC"
   );
@@ -245,8 +384,53 @@ app.get("/api/posts", async (_req, res) => {
   return res.json({ posts });
 });
 
+app.get("/api/posts/:id", async (req, res) => {
+  const { id } = req.params;
+  const [postRows] = await pool.query(
+    "SELECT p.id, p.title, p.content, p.excerpt, p.author, p.created_at, p.tags, p.likes, p.views, p.image_base64, COALESCE(c.comment_count, 0) AS comment_count FROM posts p LEFT JOIN (SELECT post_id, COUNT(*) AS comment_count FROM comments GROUP BY post_id) c ON c.post_id = p.id WHERE p.id = ? LIMIT 1",
+    [id]
+  );
+  if (!postRows.length) {
+    return res.status(404).json({ error: "Post not found" });
+  }
+  const post = mapPostRow(postRows[0]);
+  post.commentCount = Number(postRows[0].comment_count) || 0;
+
+  return res.json({ post });
+});
+
+app.get("/api/posts/:id/comments", async (req, res) => {
+  const { id } = req.params;
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(50, Math.max(1, Number(req.query.pageSize || 5)));
+  const offset = (page - 1) * pageSize;
+
+  const [countRows] = await pool.query(
+    "SELECT COUNT(*) AS total FROM comments WHERE post_id = ?",
+    [id]
+  );
+  const total = Number(countRows[0]?.total || 0);
+
+  const [commentRows] = await pool.query(
+    "SELECT id, post_id, author, content, created_at, likes, image_base64, location FROM comments WHERE post_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+    [id, pageSize, offset]
+  );
+
+  const comments = commentRows.map((row) => ({
+    id: row.id,
+    author: row.author,
+    content: row.content,
+    createdAt: Number(row.created_at),
+    likes: Number(row.likes),
+    imageUrl: row.image_base64 || null,
+    location: row.location || null
+  }));
+
+  return res.json({ comments, page, pageSize, total });
+});
+
 app.post("/api/posts", requireAdmin, async (req, res) => {
-  const { title, content, excerpt, author, tags, imageBase64 } = req.body || {};
+  const { title, content, excerpt, author, tags, imageBase64, imageUrl } = req.body || {};
   if (!title || !content || !excerpt || !author) {
     return res.status(400).json({ error: "Missing fields" });
   }
@@ -254,10 +438,11 @@ app.post("/api/posts", requireAdmin, async (req, res) => {
   const id = Math.random().toString(36).slice(2, 10);
   const createdAt = Date.now();
   const tagJson = JSON.stringify(tags || []);
+  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
 
   await pool.query(
     "INSERT INTO posts (id, title, content, excerpt, author, created_at, tags, likes, views, image_base64) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
-    [id, title, content, excerpt, author, createdAt, tagJson, imageBase64 || null]
+    [id, title, content, excerpt, author, createdAt, tagJson, resolvedImageUrl]
   );
 
   return res.status(201).json({
@@ -272,18 +457,19 @@ app.post("/api/posts", requireAdmin, async (req, res) => {
       likes: 0,
       views: 0,
       comments: [],
-      imageUrl: imageBase64 || null
+      imageUrl: resolvedImageUrl
     }
   });
 });
 
 app.put("/api/posts/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { title, content, excerpt, tags, imageBase64 } = req.body || {};
+  const { title, content, excerpt, tags, imageBase64, imageUrl } = req.body || {};
+  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
 
   await pool.query(
     "UPDATE posts SET title = ?, content = ?, excerpt = ?, tags = ?, image_base64 = ? WHERE id = ?",
-    [title, content, excerpt, JSON.stringify(tags || []), imageBase64 || null, id]
+    [title, content, excerpt, JSON.stringify(tags || []), resolvedImageUrl, id]
   );
 
   return res.json({ ok: true });
@@ -312,17 +498,18 @@ app.post("/api/posts/:id/view", async (req, res) => {
 
 app.post("/api/posts/:id/comments", async (req, res) => {
   const { id } = req.params;
-  const { author, content, imageBase64, location } = req.body || {};
-  if (!author || (!content && !imageBase64)) {
+  const { author, content, imageBase64, imageUrl, location } = req.body || {};
+  if (!author || (!content && !imageBase64 && !imageUrl)) {
     return res.status(400).json({ error: "Missing fields" });
   }
 
   const commentId = Math.random().toString(36).slice(2, 10);
   const createdAt = Date.now();
+  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
 
   await pool.query(
     "INSERT INTO comments (id, post_id, author, content, created_at, likes, image_base64, location) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
-    [commentId, id, author, content || "", createdAt, imageBase64 || null, location || null]
+    [commentId, id, author, content || "", createdAt, resolvedImageUrl, location || null]
   );
 
   return res.status(201).json({
@@ -332,7 +519,7 @@ app.post("/api/posts/:id/comments", async (req, res) => {
       content: content || "",
       createdAt,
       likes: 0,
-      imageUrl: imageBase64 || null,
+      imageUrl: resolvedImageUrl,
       location: location || null
     }
   });
@@ -357,7 +544,7 @@ app.post("/api/tts", async (req, res) => {
     if (!input) {
       return res.status(400).json({ error: "Missing input" });
     }
-    const apiKey = process.env.ZHIPU_API_KEY;
+    const apiKey = process.env.ZHIPU_API_KEY || process.env.VITE_ZHIPU_API_KEY;
     if (!apiKey) {
       return res.status(500).json({ error: "Missing ZHIPU_API_KEY" });
     }
@@ -421,6 +608,11 @@ app.post("/api/tts", async (req, res) => {
       }
 
       if (!response.ok) {
+        console.error("TTS upstream failed:", {
+          status: response.status,
+          statusText: response.statusText,
+          detail: lastDetail
+        });
         const error = new Error("TTS request failed");
         error.status = response.status;
         error.detail = lastDetail;
@@ -442,7 +634,7 @@ app.post("/api/tts", async (req, res) => {
   } catch (error) {
     console.error("TTS error:", error);
     const status = error?.status || 500;
-    const detail = error?.detail || "";
+    const detail = error?.detail || error?.message || "";
     return res.status(status).json({ error: "TTS server error", detail });
   }
 });

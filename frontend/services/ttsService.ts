@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://115.159.107.56:3001/api";
 const MOSS_TTS_VOICE = import.meta.env.VITE_MOSS_TTS_VOICE as string | undefined;
 
 export async function synthesizeMossSpeech(text: string): Promise<Blob> {

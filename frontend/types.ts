@@ -10,6 +10,7 @@ export interface Post {
   likes: number;
   views: number;
   comments: Comment[];
+  commentCount?: number;
   imageUrl?: string;
 }
 
