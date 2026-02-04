@@ -2,21 +2,32 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import mysql from "mysql2/promise";
+import { createClient } from "redis";
 import fetch from "node-fetch";
 import fs from "fs";
 import path from "path";
 import multer from "multer";
+import compression from "compression";
+import sharp from "sharp";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
+app.use(compression());
 app.use(express.json({ limit: "20mb" }));
 app.set("trust proxy", true);
 
 const uploadDir = path.resolve(process.cwd(), "uploads");
 fs.mkdirSync(uploadDir, { recursive: true });
-app.use("/uploads", express.static(uploadDir));
+app.use(
+  "/uploads",
+  express.static(uploadDir, {
+    maxAge: "30d",
+    etag: true,
+    immutable: true
+  })
+);
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "127.0.0.1",
@@ -28,6 +39,76 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0
 });
+
+const ONLINE_TTL_MS = 20000;
+const ONLINE_KEY = "lx:online_users";
+
+const onlineUsers = new Map();
+let redisClient = null;
+let redisReady = false;
+
+const initRedis = async () => {
+  const url = process.env.REDIS_URL;
+  if (!url) {
+    console.warn("REDIS_URL not set, fallback to in-memory online counter.");
+    return;
+  }
+  redisClient = createClient({ url });
+  redisClient.on("error", (err) => {
+    console.error("Redis error:", err);
+  });
+  try {
+    await redisClient.connect();
+    redisReady = true;
+    console.log("Redis connected for online counter.");
+  } catch (err) {
+    console.error("Redis connect failed, fallback to in-memory:", err);
+    redisReady = false;
+  }
+};
+
+const touchOnlineUser = async (username) => {
+  if (!username) return;
+  const now = Date.now();
+  if (redisReady && redisClient) {
+    await redisClient.zAdd(ONLINE_KEY, [{ score: now, value: username }]);
+    return;
+  }
+  onlineUsers.set(username, { lastSeen: now });
+};
+
+const pruneOnlineUsers = async () => {
+  const cutoff = Date.now() - ONLINE_TTL_MS;
+  if (redisReady && redisClient) {
+    await redisClient.zRemRangeByScore(ONLINE_KEY, 0, cutoff);
+    return;
+  }
+  for (const [username, data] of onlineUsers.entries()) {
+    if (!data || data.lastSeen < cutoff) {
+      onlineUsers.delete(username);
+    }
+  }
+};
+
+const getOnlineCount = async () => {
+  const cutoff = Date.now() - ONLINE_TTL_MS;
+  if (redisReady && redisClient) {
+    await pruneOnlineUsers();
+    const count = await redisClient.zCount(ONLINE_KEY, cutoff, "+inf");
+    return count;
+  }
+  await pruneOnlineUsers();
+  return onlineUsers.size;
+};
+
+const removeOnlineUser = async (username) => {
+  if (!username) return;
+  if (redisReady && redisClient) {
+    await redisClient.zRem(ONLINE_KEY, username);
+    return;
+  }
+  onlineUsers.delete(username);
+};
 
 const parseTags = (raw) => {
   if (!raw) return [];
@@ -76,8 +157,16 @@ const mapPostRow = (row) => ({
   likes: Number(row.likes),
   views: Number(row.views),
   comments: [],
-  imageUrl: row.image_base64 || null
+  imageUrl: row.image_base64 || null,
+  imageThumbUrl: deriveThumbUrl(row.image_base64 || null)
 });
+
+const resolveSummaryImage = (imageValue) => {
+  if (!imageValue) return null;
+  const asText = String(imageValue);
+  if (asText.startsWith("data:image/")) return null;
+  return asText;
+};
 
 const mapPostSummaryRow = (row) => ({
   id: row.id,
@@ -91,7 +180,8 @@ const mapPostSummaryRow = (row) => ({
   views: Number(row.views),
   comments: [],
   commentCount: Number(row.comment_count) || 0,
-  imageUrl: row.image_base64 || null
+  imageUrl: resolveSummaryImage(row.image_base64),
+  imageThumbUrl: deriveThumbUrl(resolveSummaryImage(row.image_base64))
 });
 
 const ALLOWED_IMAGE_MIME = new Map([
@@ -101,29 +191,91 @@ const ALLOWED_IMAGE_MIME = new Map([
   ["image/gif", "gif"]
 ]);
 
+const IMAGE_WEBP_QUALITY = 80;
+const IMAGE_THUMB_QUALITY = 70;
+const IMAGE_THUMB_WIDTH = 480;
+
+const SUMMARY_CACHE_TTL_MS = 30000;
+const summaryCache = new Map();
+
+const getSummaryCache = (key) => {
+  const cached = summaryCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.at > SUMMARY_CACHE_TTL_MS) {
+    summaryCache.delete(key);
+    return null;
+  }
+  return cached.value;
+};
+
+const setSummaryCache = (key, value) => {
+  summaryCache.set(key, { at: Date.now(), value });
+};
+
+const clearSummaryCache = () => {
+  summaryCache.clear();
+};
+
 const buildPublicUrl = (req, filename) => {
   const host = req.get("host");
   const protocol = req.protocol || "http";
   return `${protocol}://${host}/uploads/${filename}`;
 };
 
-const saveBase64Image = (req, dataUrl) => {
-  if (!dataUrl || typeof dataUrl !== "string") return null;
-  if (!dataUrl.startsWith("data:image/")) return dataUrl;
-  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+const deriveThumbUrl = (imageUrl) => {
+  if (!imageUrl) return null;
+  const match = String(imageUrl).match(/^(.*\/uploads\/)([^/?#]+)\.webp$/i);
   if (!match) return null;
-  const mime = match[1];
-  const ext = ALLOWED_IMAGE_MIME.get(mime) || "png";
-  const filename = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
-  const buffer = Buffer.from(match[2], "base64");
-  fs.writeFileSync(path.join(uploadDir, filename), buffer);
-  return buildPublicUrl(req, filename);
+  return `${match[1]}${match[2]}_thumb.webp`;
 };
 
-const resolveImageUrl = (req, imageUrl, imageBase64) => {
-  if (imageUrl) return imageUrl;
-  if (imageBase64) return saveBase64Image(req, imageBase64);
-  return null;
+const writeImageVariants = async (buffer, baseName) => {
+  const mainName = `${baseName}.webp`;
+  const thumbName = `${baseName}_thumb.webp`;
+  await sharp(buffer).webp({ quality: IMAGE_WEBP_QUALITY }).toFile(path.join(uploadDir, mainName));
+  await sharp(buffer)
+    .resize({ width: IMAGE_THUMB_WIDTH, withoutEnlargement: true })
+    .webp({ quality: IMAGE_THUMB_QUALITY })
+    .toFile(path.join(uploadDir, thumbName));
+  return { mainName, thumbName };
+};
+
+const saveBase64Image = async (req, dataUrl) => {
+  if (!dataUrl || typeof dataUrl !== "string") {
+    return { url: null, thumbUrl: null };
+  }
+  if (!dataUrl.startsWith("data:image/")) {
+    return { url: dataUrl, thumbUrl: deriveThumbUrl(dataUrl) };
+  }
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return { url: null, thumbUrl: null };
+  const mime = match[1];
+  if (!ALLOWED_IMAGE_MIME.has(mime)) return { url: null, thumbUrl: null };
+  const baseName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const buffer = Buffer.from(match[2], "base64");
+  const { mainName, thumbName } = await writeImageVariants(buffer, baseName);
+  return {
+    url: buildPublicUrl(req, mainName),
+    thumbUrl: buildPublicUrl(req, thumbName)
+  };
+};
+
+const resolveImageUrl = async (req, imageUrl, imageBase64) => {
+  if (imageUrl) {
+    return { url: imageUrl, thumbUrl: deriveThumbUrl(imageUrl) };
+  }
+  if (imageBase64) return await saveBase64Image(req, imageBase64);
+  return { url: null, thumbUrl: null };
+};
+
+const processUploadedFile = async (req, filePath, baseName) => {
+  const buffer = await fs.promises.readFile(filePath);
+  const { mainName, thumbName } = await writeImageVariants(buffer, baseName);
+  await fs.promises.unlink(filePath).catch(() => {});
+  return {
+    url: buildPublicUrl(req, mainName),
+    thumbUrl: buildPublicUrl(req, thumbName)
+  };
 };
 
 const uploadStorage = multer.diskStorage({
@@ -190,12 +342,14 @@ app.get("/api/tags", async (_req, res) => {
   return res.json({ tags: Array.from(tagSet) });
 });
 
-app.post("/api/uploads", upload.single("file"), (req, res) => {
+app.post("/api/uploads", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "Missing file" });
   }
-  const url = buildPublicUrl(req, req.file.filename);
-  return res.status(201).json({ url });
+  const baseName = path.parse(req.file.filename).name;
+  const filePath = path.join(uploadDir, req.file.filename);
+  const { url, thumbUrl } = await processUploadedFile(req, filePath, baseName);
+  return res.status(201).json({ url, thumbUrl });
 });
 
 app.post("/api/auth/login", async (req, res) => {
@@ -225,6 +379,7 @@ app.post("/api/auth/login", async (req, res) => {
     await pool.query("UPDATE users SET `rank` = ? WHERE id = ?", [computedRank, user.id]);
   }
 
+  await touchOnlineUser(username);
   return res.json({
     user: {
       id: user.id,
@@ -234,6 +389,25 @@ app.post("/api/auth/login", async (req, res) => {
       totalSeconds
     }
   });
+});
+
+app.post("/api/auth/logout", async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: "Missing credentials" });
+  }
+
+  const [rows] = await pool.query(
+    "SELECT id FROM users WHERE username = ? AND password = ? LIMIT 1",
+    [username, password]
+  );
+
+  if (!rows.length) {
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+
+  await removeOnlineUser(username);
+  return res.json({ ok: true });
 });
 
 app.post("/api/auth/register", async (req, res) => {
@@ -265,11 +439,6 @@ app.post("/api/users/heartbeat", async (req, res) => {
     return res.status(400).json({ error: "Missing credentials" });
   }
 
-  const delta = Math.max(0, Math.floor(Number(deltaSeconds) || 0));
-  if (delta <= 0) {
-    return res.json({ ok: true });
-  }
-
   const [rows] = await pool.query(
     "SELECT id, total_seconds, `rank` FROM users WHERE username = ? AND password = ? LIMIT 1",
     [username, password]
@@ -277,6 +446,12 @@ app.post("/api/users/heartbeat", async (req, res) => {
 
   if (!rows.length) {
     return res.status(401).json({ error: "Invalid credentials" });
+  }
+
+  await touchOnlineUser(username);
+  const delta = Math.max(0, Math.floor(Number(deltaSeconds) || 0));
+  if (delta <= 0) {
+    return res.json({ ok: true });
   }
 
   const user = rows[0];
@@ -297,6 +472,11 @@ app.post("/api/users/heartbeat", async (req, res) => {
     fromRank: previousRank,
     toRank: nextRank
   });
+});
+
+app.get("/api/users/online", async (_req, res) => {
+  const count = await getOnlineCount();
+  return res.json({ count });
 });
 
 app.get("/api/users/leaderboard", async (_req, res) => {
@@ -320,6 +500,11 @@ app.get("/api/posts", async (req, res) => {
     const sort = String(req.query.sort || "newest");
     const search = String(req.query.search || "").trim();
     const tag = String(req.query.tag || "").trim();
+    const cacheKey = JSON.stringify({ page, pageSize, sort, search, tag });
+    const cached = getSummaryCache(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
 
     const sortMap = new Map([
       ["newest", "p.created_at DESC"],
@@ -354,7 +539,9 @@ app.get("/api/posts", async (req, res) => {
       [...params, pageSize, offset]
     );
     const posts = postRows.map(mapPostSummaryRow);
-    return res.json({ posts, page, pageSize, total });
+    const payload = { posts, page, pageSize, total };
+    setSummaryCache(cacheKey, payload);
+    return res.json(payload);
   }
 
   const [postRows] = await pool.query(
@@ -377,6 +564,7 @@ app.get("/api/posts", async (req, res) => {
       createdAt: Number(row.created_at),
       likes: Number(row.likes),
       imageUrl: row.image_base64 || null,
+      imageThumbUrl: deriveThumbUrl(row.image_base64 || null),
       location: row.location || null
     });
   }
@@ -423,6 +611,7 @@ app.get("/api/posts/:id/comments", async (req, res) => {
     createdAt: Number(row.created_at),
     likes: Number(row.likes),
     imageUrl: row.image_base64 || null,
+    imageThumbUrl: deriveThumbUrl(row.image_base64 || null),
     location: row.location || null
   }));
 
@@ -438,12 +627,15 @@ app.post("/api/posts", requireAdmin, async (req, res) => {
   const id = Math.random().toString(36).slice(2, 10);
   const createdAt = Date.now();
   const tagJson = JSON.stringify(tags || []);
-  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImage = await resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImageUrl = resolvedImage?.url || null;
+  const resolvedThumbUrl = resolvedImage?.thumbUrl || null;
 
   await pool.query(
     "INSERT INTO posts (id, title, content, excerpt, author, created_at, tags, likes, views, image_base64) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
     [id, title, content, excerpt, author, createdAt, tagJson, resolvedImageUrl]
   );
+  clearSummaryCache();
 
   return res.status(201).json({
     post: {
@@ -457,7 +649,8 @@ app.post("/api/posts", requireAdmin, async (req, res) => {
       likes: 0,
       views: 0,
       comments: [],
-      imageUrl: resolvedImageUrl
+      imageUrl: resolvedImageUrl,
+      imageThumbUrl: resolvedThumbUrl
     }
   });
 });
@@ -465,12 +658,14 @@ app.post("/api/posts", requireAdmin, async (req, res) => {
 app.put("/api/posts/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { title, content, excerpt, tags, imageBase64, imageUrl } = req.body || {};
-  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImage = await resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImageUrl = resolvedImage?.url || null;
 
   await pool.query(
     "UPDATE posts SET title = ?, content = ?, excerpt = ?, tags = ?, image_base64 = ? WHERE id = ?",
     [title, content, excerpt, JSON.stringify(tags || []), resolvedImageUrl, id]
   );
+  clearSummaryCache();
 
   return res.json({ ok: true });
 });
@@ -479,6 +674,7 @@ app.delete("/api/posts/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
   await pool.query("DELETE FROM comments WHERE post_id = ?", [id]);
   await pool.query("DELETE FROM posts WHERE id = ?", [id]);
+  clearSummaryCache();
   return res.json({ ok: true });
 });
 
@@ -486,6 +682,7 @@ app.post("/api/posts/:id/like", async (req, res) => {
   const { id } = req.params;
   await pool.query("UPDATE posts SET likes = likes + 1 WHERE id = ?", [id]);
   const [rows] = await pool.query("SELECT likes FROM posts WHERE id = ?", [id]);
+  clearSummaryCache();
   return res.json({ likes: rows[0]?.likes ?? 0 });
 });
 
@@ -493,6 +690,7 @@ app.post("/api/posts/:id/view", async (req, res) => {
   const { id } = req.params;
   await pool.query("UPDATE posts SET views = views + 1 WHERE id = ?", [id]);
   const [rows] = await pool.query("SELECT views FROM posts WHERE id = ?", [id]);
+  clearSummaryCache();
   return res.json({ views: rows[0]?.views ?? 0 });
 });
 
@@ -505,12 +703,15 @@ app.post("/api/posts/:id/comments", async (req, res) => {
 
   const commentId = Math.random().toString(36).slice(2, 10);
   const createdAt = Date.now();
-  const resolvedImageUrl = resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImage = await resolveImageUrl(req, imageUrl, imageBase64);
+  const resolvedImageUrl = resolvedImage?.url || null;
+  const resolvedThumbUrl = resolvedImage?.thumbUrl || null;
 
   await pool.query(
     "INSERT INTO comments (id, post_id, author, content, created_at, likes, image_base64, location) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
     [commentId, id, author, content || "", createdAt, resolvedImageUrl, location || null]
   );
+  clearSummaryCache();
 
   return res.status(201).json({
     comment: {
@@ -520,6 +721,7 @@ app.post("/api/posts/:id/comments", async (req, res) => {
       createdAt,
       likes: 0,
       imageUrl: resolvedImageUrl,
+      imageThumbUrl: resolvedThumbUrl,
       location: location || null
     }
   });
@@ -528,6 +730,7 @@ app.post("/api/posts/:id/comments", async (req, res) => {
 app.delete("/api/posts/:postId/comments/:commentId", requireAdmin, async (req, res) => {
   const { postId, commentId } = req.params;
   await pool.query("DELETE FROM comments WHERE id = ? AND post_id = ?", [commentId, postId]);
+  clearSummaryCache();
   return res.json({ ok: true });
 });
 
@@ -647,6 +850,7 @@ app.use((err, _req, res, _next) => {
 const port = Number(process.env.SERVER_PORT || 3001);
 (async () => {
   await ensureAdminUser();
+  await initRedis();
   app.listen(port, () => {
     console.log(`API server running on ${port}`);
   });

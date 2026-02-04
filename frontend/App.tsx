@@ -39,7 +39,7 @@ import { synthesizeMossSpeech } from './services/ttsService';
 // 智谱克隆音色播报
 
 const COMMENTS_PER_PAGE = 5;
-const API_BASE = import.meta.env.VITE_API_BASE || "115.159.107.56:30001/api";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
 const DEFAULT_COVER = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&q=80&w=800";
 
 // --- 类型扩展 ---
@@ -441,8 +441,10 @@ export default function App() {
   const rocketFlameRef = useRef<HTMLDivElement | null>(null);
   const flameRafRef = useRef<number | null>(null);
   const flameStartRef = useRef<number | null>(null);
+  const flameStopTimerRef = useRef<number | null>(null);
+  const lastPointerDownAtRef = useRef<number>(0);
   const [uptimeText, setUptimeText] = useState('');
-  const [onlineCount, setOnlineCount] = useState(1);
+  const [onlineCount, setOnlineCount] = useState(0);
   
   // 用户与权限系统
   const [currentUser, setCurrentUser] = useState<UserData | null>(() => {
@@ -495,8 +497,8 @@ export default function App() {
     message: '',
     onConfirm: () => {},
   });
-  const tabIdRef = useRef<string>('');
   const modalOpen = showAuth || showWelcome || rankNotice.visible || showRankBoard || isEditorOpen || confirmModal.isOpen;
+  const modalOpenRef = useRef(false);
 
   // 同步到 LocalStorage
   useEffect(() => {
@@ -518,6 +520,10 @@ export default function App() {
   }, [showAuth]);
 
   useEffect(() => {
+    modalOpenRef.current = modalOpen;
+  }, [modalOpen]);
+
+  useEffect(() => {
     if (typeof document === 'undefined') return;
     if (modalOpen) {
       document.body.classList.add('modal-open');
@@ -526,16 +532,24 @@ export default function App() {
     document.body.classList.remove('modal-open');
   }, [modalOpen]);
 
+  const fetchOnlineCount = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/users/online`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const count = Number(data?.count);
+      if (Number.isFinite(count)) {
+        setOnlineCount(Math.max(0, count));
+      }
+    } catch (error) {
+      console.error('Online count error:', error);
+    }
+  }, []);
+
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const start = new Date('2026-02-01T00:00:00');
-    const key = 'lx_station_online_map';
-    const now = Date.now();
-    if (!tabIdRef.current) {
-      const saved = sessionStorage.getItem('lx_tab_id');
-      tabIdRef.current = saved || `tab_${now}_${Math.random().toString(36).slice(2, 8)}`;
-      sessionStorage.setItem('lx_tab_id', tabIdRef.current);
-    }
+    let lastOnlineSync = 0;
 
     const formatUptime = (ms: number) => {
       const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -553,71 +567,26 @@ export default function App() {
       return `已稳定运行 ${days} 天 ${hours} 时 ${minutes} 分 ${seconds} 秒，累计行驶 ${traveledText} 光年，距离新家园还有 ${remainingText} 光年`;
     };
 
-    const readMap = () => {
-      try {
-        const raw = localStorage.getItem(key);
-        const parsed = raw ? JSON.parse(raw) : {};
-        return typeof parsed === 'object' && parsed ? parsed : {};
-      } catch {
-        return {};
-      }
-    };
-
-    const writeMap = (next: Record<string, number>) => {
-      try {
-        localStorage.setItem(key, JSON.stringify(next));
-      } catch {
-        // ignore
-      }
-    };
-
-    const heartbeat = () => {
-      const map = readMap();
-      map[tabIdRef.current] = Date.now();
-      const cutoff = Date.now() - 20000;
-      Object.keys(map).forEach((id) => {
-        if (map[id] < cutoff) delete map[id];
-      });
-      writeMap(map);
-      setOnlineCount(Math.max(1, Object.keys(map).length));
-    };
-
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key !== key) return;
-      const map = readMap();
-      const cutoff = Date.now() - 20000;
-      Object.keys(map).forEach((id) => {
-        if (map[id] < cutoff) delete map[id];
-      });
-      setOnlineCount(Math.max(1, Object.keys(map).length));
-    };
-
     const updateUptime = () => {
       setUptimeText(formatUptime(Date.now() - start.getTime()));
     };
 
     const intervalId = window.setInterval(() => {
       updateUptime();
-      heartbeat();
+      const now = Date.now();
+      if (now - lastOnlineSync >= 5000) {
+        lastOnlineSync = now;
+        void fetchOnlineCount();
+      }
     }, 1000);
 
     updateUptime();
-    heartbeat();
-    window.addEventListener('storage', handleStorage);
-    window.addEventListener('beforeunload', () => {
-      const map = readMap();
-      delete map[tabIdRef.current];
-      writeMap(map);
-    });
+    void fetchOnlineCount();
 
     return () => {
       window.clearInterval(intervalId);
-      window.removeEventListener('storage', handleStorage);
-      const map = readMap();
-      delete map[tabIdRef.current];
-      writeMap(map);
     };
-  }, []);
+  }, [fetchOnlineCount]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -633,14 +602,16 @@ export default function App() {
       node.style.setProperty('--fy', `${y}px`);
     };
 
+    const minScale = 0.9;
+    const maxScale = 1.8;
+    const maxMs = 420;
+    const minVisibleMs = 140;
+
     const animateFlame = () => {
       const start = flameStartRef.current;
       const node = rocketFlameRef.current;
       if (!start || !node) return;
       const elapsed = Math.max(0, performance.now() - start);
-      const maxMs = 900;
-      const minScale = 0.6;
-      const maxScale = 1.8;
       const t = Math.min(1, elapsed / maxMs);
       const scale = minScale + (maxScale - minScale) * t;
       const flicker = 0.88 + Math.random() * 0.24;
@@ -656,20 +627,17 @@ export default function App() {
     const handleMove = (e: PointerEvent | MouseEvent) => {
       updateFlamePos(e.clientX, e.clientY);
     };
-    const handleDown = (e: PointerEvent | MouseEvent) => {
-      document.body.classList.add('rocket-firing');
-      flameStartRef.current = performance.now();
-      updateFlamePos(e.clientX, e.clientY);
-      if (!flameRafRef.current) {
-        flameRafRef.current = win.requestAnimationFrame(animateFlame);
-      }
-    };
-    const stopFlame = () => {
+
+    const stopFlameNow = () => {
       document.body.classList.remove('rocket-firing');
       flameStartRef.current = null;
       if (flameRafRef.current) {
         win.cancelAnimationFrame(flameRafRef.current);
         flameRafRef.current = null;
+      }
+      if (flameStopTimerRef.current) {
+        win.clearTimeout(flameStopTimerRef.current);
+        flameStopTimerRef.current = null;
       }
       const node = rocketFlameRef.current;
       if (node) {
@@ -679,9 +647,60 @@ export default function App() {
         node.style.setProperty('--flameJy', '0px');
       }
     };
+
+    const stopFlame = () => {
+      const start = flameStartRef.current;
+      if (!start) {
+        stopFlameNow();
+        return;
+      }
+      const elapsed = performance.now() - start;
+      if (elapsed >= minVisibleMs) {
+        stopFlameNow();
+        return;
+      }
+      if (flameStopTimerRef.current) {
+        win.clearTimeout(flameStopTimerRef.current);
+      }
+      flameStopTimerRef.current = win.setTimeout(stopFlameNow, minVisibleMs - elapsed);
+    };
+
+    const startFlame = (x: number, y: number) => {
+      if (flameStopTimerRef.current) {
+        win.clearTimeout(flameStopTimerRef.current);
+        flameStopTimerRef.current = null;
+      }
+      document.body.classList.add('rocket-firing');
+      const now = performance.now();
+      const boostedStart = modalOpenRef.current ? now - maxMs : now;
+      flameStartRef.current = boostedStart;
+      const node = rocketFlameRef.current;
+      if (node) {
+        node.style.setProperty('--fx', `${x}px`);
+        node.style.setProperty('--fy', `${y}px`);
+        node.style.setProperty('--flameScale', (modalOpenRef.current ? maxScale : minScale).toFixed(3));
+        node.style.setProperty('--flameOpacity', '1');
+        node.style.setProperty('--flameJx', '0px');
+        node.style.setProperty('--flameJy', '0px');
+      }
+      if (!flameRafRef.current) {
+        flameRafRef.current = win.requestAnimationFrame(animateFlame);
+      }
+    };
+
+    const handleDown = (e: PointerEvent | MouseEvent) => {
+      lastPointerDownAtRef.current = performance.now();
+      startFlame(e.clientX, e.clientY);
+    };
+    const handleMouseDown = (e: MouseEvent) => {
+      const now = performance.now();
+      if (now - lastPointerDownAtRef.current < 80) return;
+      startFlame(e.clientX, e.clientY);
+    };
     const handleUp = () => stopFlame();
     const handleLeave = () => stopFlame();
     const handleBlur = () => stopFlame();
+    const handleCancel = () => stopFlame();
 
     win.addEventListener('pointermove', handleMove, { passive: true });
     if ('onpointerrawupdate' in win) {
@@ -689,8 +708,12 @@ export default function App() {
     } else {
       win.addEventListener('mousemove', handleMove, { passive: true });
     }
-    win.addEventListener('pointerdown', handleDown);
-    win.addEventListener('pointerup', handleUp);
+    const pointerCaptureOptions: AddEventListenerOptions = { capture: true, passive: true };
+    win.addEventListener('pointerdown', handleDown, pointerCaptureOptions);
+    win.addEventListener('pointerup', handleUp, pointerCaptureOptions);
+    win.addEventListener('pointercancel', handleCancel, pointerCaptureOptions);
+    win.addEventListener('mousedown', handleMouseDown, pointerCaptureOptions);
+    win.addEventListener('mouseup', handleUp, pointerCaptureOptions);
     win.addEventListener('mouseleave', handleLeave);
     win.addEventListener('blur', handleBlur);
 
@@ -702,14 +725,21 @@ export default function App() {
         win.cancelAnimationFrame(flameRafRef.current);
         flameRafRef.current = null;
       }
+      if (flameStopTimerRef.current) {
+        win.clearTimeout(flameStopTimerRef.current);
+        flameStopTimerRef.current = null;
+      }
       win.removeEventListener('pointermove', handleMove);
       if ('onpointerrawupdate' in win) {
         win.removeEventListener('pointerrawupdate', handleMove as EventListener);
       } else {
         win.removeEventListener('mousemove', handleMove as EventListener);
       }
-      win.removeEventListener('pointerdown', handleDown);
-      win.removeEventListener('pointerup', handleUp);
+      win.removeEventListener('pointerdown', handleDown, pointerCaptureOptions);
+      win.removeEventListener('pointerup', handleUp, pointerCaptureOptions);
+      win.removeEventListener('pointercancel', handleCancel, pointerCaptureOptions);
+      win.removeEventListener('mousedown', handleMouseDown, pointerCaptureOptions);
+      win.removeEventListener('mouseup', handleUp, pointerCaptureOptions);
       win.removeEventListener('mouseleave', handleLeave);
       win.removeEventListener('blur', handleBlur);
     };
@@ -742,6 +772,21 @@ export default function App() {
   const getUserRankLabel = useCallback((user?: UserData | null) => {
     return user?.rank || '士兵';
   }, []);
+
+  const isManagedRank = useCallback((rank?: string) => {
+    if (!rank) return false;
+    return RANK_RULES.some(rule => rule.name === rank);
+  }, []);
+
+  const shouldSyncRank = useCallback((currentRank?: string, nextRank?: string) => {
+    if (!nextRank) return false;
+    if (!currentRank) return true;
+    // 自定义军衔不被自动“降级/覆盖”
+    if (!isManagedRank(currentRank)) {
+      return !isManagedRank(nextRank);
+    }
+    return true;
+  }, [isManagedRank]);
 
   const openRankNotice = useCallback((message: string) => {
     setRankNotice({ visible: true, message });
@@ -863,14 +908,16 @@ export default function App() {
           return;
         }
         const data = await res.json();
+        const nextRank = typeof data?.rank === 'string' ? data.rank : undefined;
+        const allowRankUpdate = shouldSyncRank(currentUser.rank, nextRank);
         if (data?.rank || Number.isFinite(data?.totalSeconds)) {
           setCurrentUser(prev => prev ? {
             ...prev,
-            rank: data.rank ?? prev.rank,
+            rank: allowRankUpdate ? (nextRank ?? prev.rank) : prev.rank,
             totalSeconds: Number.isFinite(data.totalSeconds) ? data.totalSeconds : prev.totalSeconds
           } : prev);
         }
-        if (data?.upgraded && data?.fromRank && data?.toRank) {
+        if (allowRankUpdate && data?.upgraded && data?.fromRank && data?.toRank) {
           const duration = formatDuration(Number(data.totalSeconds || 0));
           openRankNotice(`${currentUser.username}${data.fromRank}，您在领航者空间站执行任务时长已达${duration}，军衔升至${data.toRank}`);
         }
@@ -907,6 +954,26 @@ export default function App() {
     }
     setIsMusicPlaying(!isMusicPlaying);
   }, [isMusicPlaying]);
+
+  const handleLogout = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      await fetch(`${API_BASE}/auth/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: currentUser.username,
+          password: currentUser.password
+        }),
+        keepalive: true
+      });
+    } catch (error) {
+      console.error('Logout error:', error);
+    } finally {
+      setCurrentUser(null);
+      void fetchOnlineCount();
+    }
+  }, [currentUser, fetchOnlineCount]);
 
   const paginatedPosts = posts;
 
@@ -1121,6 +1188,7 @@ export default function App() {
         setShowAuth(false);
         setAuthError(null);
         openWelcome(newUser.username, newUser.rank);
+        void fetchOnlineCount();
         return;
       }
 
@@ -1318,9 +1386,7 @@ export default function App() {
       )}
 
       {showWelcome && welcomeUser && (
-        <div
-          className={`fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 ${welcomeFading ? 'opacity-0 transition-opacity duration-700' : 'opacity-100'} modal-backdrop`}
-        >
+        <div className={`fixed inset-0 z-[220] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 ${welcomeFading ? 'opacity-0 transition-opacity duration-700' : 'opacity-100'} modal-backdrop`}>
           <div className="cyber-border-red bg-black w-full max-w-md p-8 relative shadow-[0_0_50px_rgba(255,0,0,0.3)]">
             <button
               onClick={() => setShowWelcome(false)}
@@ -1343,9 +1409,7 @@ export default function App() {
       )}
 
       {rankNotice.visible && (
-        <div
-          className="fixed inset-0 z-[230] flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop"
-        >
+        <div className="fixed inset-0 z-[230] flex items-center justify-center bg-black/70 backdrop-blur-md p-4 modal-backdrop">
           <div className="cyber-border-red bg-black w-full max-w-lg p-6 relative shadow-[0_0_40px_rgba(255,0,0,0.4)]">
             <button
               onClick={() => setRankNotice({ visible: false, message: '' })}
@@ -1533,7 +1597,7 @@ export default function App() {
                   <Plus className="w-4 h-4 inline mr-2" /> 系统广播
                 </CyberButton>
               )}
-              <CyberButton onClick={() => setCurrentUser(null)} variant="danger">
+              <CyberButton onClick={handleLogout} variant="danger">
                 <LogOut className="w-4 h-4 inline mr-2" /> 撤销接入
               </CyberButton>
             </div>
