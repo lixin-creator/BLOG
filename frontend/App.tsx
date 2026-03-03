@@ -33,19 +33,88 @@ import {
 } from 'lucide-react';
 import { Post, Comment, SortOption } from './types';
 import { POSTS_PER_PAGE } from './constants';
-import { generateExcerpt } from './services/geminiService';
-import { askMOSS } from './services/mossService';
-import { synthesizeMossSpeech } from './services/ttsService';
 // 智谱克隆音色播报
 
 const COMMENTS_PER_PAGE = 5;
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001/api";
+const RANK_BOARD_PAGE_SIZE = 10;
+const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 const DEFAULT_COVER = "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&q=80&w=800";
+const PERMANENT_BAN_THRESHOLD = 4102444800000;
+const readStoredCredentials = () => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem('lx_current_user');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const username = String(parsed?.username || '').trim();
+    const password = String(parsed?.password || '');
+    if (!username || !password) return null;
+    return { username, password };
+  } catch (_error) {
+    return null;
+  }
+};
+
+const apiFetch = (input: RequestInfo | URL, init: RequestInit = {}) => {
+  const headers = new Headers(init.headers || undefined);
+  const creds = readStoredCredentials();
+  if (creds) {
+    if (!headers.has('X-Auth-Username')) {
+      headers.set('X-Auth-Username', creds.username);
+    }
+    if (!headers.has('X-Auth-Password')) {
+      headers.set('X-Auth-Password', creds.password);
+    }
+  }
+  return fetch(input, {
+    credentials: 'include',
+    ...init,
+    headers
+  });
+};
+
+const ensureRocketCursorEnabled = () => {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  const canUse = window.matchMedia?.('(pointer: fine)')?.matches;
+  if (!canUse) return;
+  document.body.classList.add('rocket-cursor-enabled');
+};
+
+type GeminiServiceModule = typeof import('./services/geminiService');
+type MossServiceModule = typeof import('./services/mossService');
+type TtsServiceModule = typeof import('./services/ttsService');
+
+let geminiServicePromise: Promise<GeminiServiceModule> | null = null;
+let mossServicePromise: Promise<MossServiceModule> | null = null;
+let ttsServicePromise: Promise<TtsServiceModule> | null = null;
+
+const loadGeminiService = () => {
+  if (!geminiServicePromise) {
+    geminiServicePromise = import('./services/geminiService');
+  }
+  return geminiServicePromise;
+};
+
+const loadMossService = () => {
+  if (!mossServicePromise) {
+    mossServicePromise = import('./services/mossService');
+  }
+  return mossServicePromise;
+};
+
+const loadTtsService = () => {
+  if (!ttsServicePromise) {
+    ttsServicePromise = import('./services/ttsService');
+  }
+  return ttsServicePromise;
+};
 
 // --- 类型扩展 ---
 interface UserData {
+  id?: number;
   username: string;
-  password: string;
+  password?: string;
+  isAdmin?: boolean;
   rank?: string;
   totalSeconds?: number;
 }
@@ -67,7 +136,12 @@ interface RankBoardItem {
   username: string;
   rank: string;
   totalSeconds: number;
+  lastLoginAt?: number | null;
+  bannedUntil?: number;
+  isAdmin?: boolean;
 }
+
+type AuthMode = 'login' | 'register';
 
 const RANK_RULES: RankRule[] = [
   { name: '士兵', thresholdSeconds: 0 },
@@ -293,6 +367,7 @@ const MossChat: React.FC<{ username?: string; rank?: string }> = ({ username, ra
     lastSpeakRef.current = { text: speakText, at: now };
 
     try {
+      const { synthesizeMossSpeech } = await loadTtsService();
       const blob = await synthesizeMossSpeech(speakText);
       if (ttsAudioRef.current) {
         ttsAudioRef.current.pause();
@@ -333,7 +408,13 @@ const MossChat: React.FC<{ username?: string; rank?: string }> = ({ username, ra
     setInput('');
     setIsTyping(true);
 
-    const response = await askMOSS(userMsg);
+    let response = "MOSS：由于太阳风暴干扰，通讯模块暂时离线。";
+    try {
+      const { askMOSS } = await loadMossService();
+      response = await askMOSS(userMsg);
+    } catch (error) {
+      console.error('Load MOSS service error:', error);
+    }
     const mossId = `moss_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     if (isVoiceEnabled) {
       setMessages(prev => [...prev, { id: mossId, role: 'moss', text: '', fullText: response }]);
@@ -451,13 +532,13 @@ export default function App() {
     const saved = localStorage.getItem('lx_current_user');
     return saved ? JSON.parse(saved) : null;
   });
-  const [users, setUsers] = useState<UserData[]>(() => {
-    const saved = localStorage.getItem('lx_registered_users');
-    const defaultUsers: UserData[] = [];
-    return saved ? JSON.parse(saved) : defaultUsers;
-  });
   const [showAuth, setShowAuth] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authInfo, setAuthInfo] = useState<string | null>(null);
+  const [authUsername, setAuthUsername] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authConfirmPassword, setAuthConfirmPassword] = useState('');
   const [showWelcome, setShowWelcome] = useState(false);
   const [welcomeUser, setWelcomeUser] = useState<string | null>(null);
   const [welcomeRank, setWelcomeRank] = useState<string | null>(null);
@@ -467,11 +548,16 @@ export default function App() {
   const [rankBoardLoading, setRankBoardLoading] = useState(false);
   const [rankBoardError, setRankBoardError] = useState<string | null>(null);
   const [rankBoardRefreshKey, setRankBoardRefreshKey] = useState(0);
+  const [rankBoardPage, setRankBoardPage] = useState(1);
+  const [rankActionLoadingKey, setRankActionLoadingKey] = useState<string | null>(null);
   const [rankNotice, setRankNotice] = useState<{ visible: boolean; message: string }>({
     visible: false,
     message: ''
   });
-  const isAdmin = useMemo(() => currentUser?.username === 'lx', [currentUser]);
+  const isAdmin = useMemo(() => {
+    const username = String(currentUser?.username || '').trim().toLowerCase();
+    return Boolean(currentUser?.isAdmin) || username === 'lx';
+  }, [currentUser]);
 
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editingPost, setEditingPost] = useState<Post | null>(null);
@@ -500,11 +586,6 @@ export default function App() {
   const modalOpen = showAuth || showWelcome || rankNotice.visible || showRankBoard || isEditorOpen || confirmModal.isOpen;
   const modalOpenRef = useRef(false);
 
-  // 同步到 LocalStorage
-  useEffect(() => {
-    localStorage.setItem('lx_registered_users', JSON.stringify(users));
-  }, [users]);
-
   useEffect(() => {
     if (currentUser) {
       localStorage.setItem('lx_current_user', JSON.stringify(currentUser));
@@ -514,10 +595,65 @@ export default function App() {
   }, [currentUser]);
 
   useEffect(() => {
-    if (showAuth) {
-      setAuthError(null);
-    }
+    let active = true;
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/auth/me`, { signal: controller.signal });
+        if (!res.ok) {
+          if (active && res.status === 401) {
+            setCurrentUser(null);
+          }
+          return;
+        }
+        const data = await res.json();
+        if (!active) return;
+        const user = data?.user;
+        if (!user) return;
+        setCurrentUser((prev) => {
+          const nextUsername = String(user.username || '');
+          return {
+            id: Number(user.id),
+            username: nextUsername,
+            password: prev?.username === nextUsername ? prev.password : undefined,
+            isAdmin: Boolean(user.isAdmin),
+            rank: user.rank || '士兵',
+            totalSeconds: Number.isFinite(user.totalSeconds) ? Number(user.totalSeconds) : 0
+          };
+        });
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
+      }
+    })();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (showAuth) return;
+    setAuthError(null);
+    setAuthInfo(null);
+    setAuthMode('login');
+    setAuthPassword('');
+    setAuthConfirmPassword('');
   }, [showAuth]);
+
+  const openAuthModal = useCallback((mode: AuthMode = 'login', message?: string) => {
+    setAuthMode(mode);
+    setAuthInfo(null);
+    setAuthError(message || null);
+    setShowAuth(true);
+  }, []);
+
+  const switchAuthMode = useCallback((mode: AuthMode) => {
+    setAuthMode(mode);
+    setAuthError(null);
+    setAuthInfo(null);
+    setAuthPassword('');
+    setAuthConfirmPassword('');
+  }, []);
 
   useEffect(() => {
     modalOpenRef.current = modalOpen;
@@ -527,21 +663,23 @@ export default function App() {
     if (typeof document === 'undefined') return;
     if (modalOpen) {
       document.body.classList.add('modal-open');
-      return;
+    } else {
+      document.body.classList.remove('modal-open');
     }
-    document.body.classList.remove('modal-open');
+    ensureRocketCursorEnabled();
   }, [modalOpen]);
 
-  const fetchOnlineCount = useCallback(async () => {
+  const fetchOnlineCount = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch(`${API_BASE}/users/online`);
+      const res = await apiFetch(`${API_BASE}/users/online`, { signal });
       if (!res.ok) return;
       const data = await res.json();
       const count = Number(data?.count);
       if (Number.isFinite(count)) {
         setOnlineCount(Math.max(0, count));
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return;
       console.error('Online count error:', error);
     }
   }, []);
@@ -549,7 +687,7 @@ export default function App() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const start = new Date('2026-02-01T00:00:00');
-    let lastOnlineSync = 0;
+    let lastOnlineSync = Date.now();
 
     const formatUptime = (ms: number) => {
       const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -579,12 +717,16 @@ export default function App() {
         void fetchOnlineCount();
       }
     }, 1000);
+    const initialOnlineTimerId = window.setTimeout(() => {
+      lastOnlineSync = Date.now();
+      void fetchOnlineCount();
+    }, 1500);
 
     updateUptime();
-    void fetchOnlineCount();
 
     return () => {
       window.clearInterval(intervalId);
+      window.clearTimeout(initialOnlineTimerId);
     };
   }, [fetchOnlineCount]);
 
@@ -593,7 +735,7 @@ export default function App() {
     const win: any = globalThis as any;
     const canUse = win.matchMedia?.('(pointer: fine)')?.matches;
     if (!canUse) return;
-    document.body.classList.add('rocket-cursor-enabled');
+    ensureRocketCursorEnabled();
 
     const updateFlamePos = (x: number, y: number) => {
       const node = rocketFlameRef.current;
@@ -769,6 +911,17 @@ export default function App() {
     return `${Math.floor(totalSeconds / 60)}分钟`;
   }, []);
 
+  const formatDateTime = useCallback((timestamp?: number | null) => {
+    const value = Number(timestamp);
+    if (!Number.isFinite(value) || value <= 0) return '从未登录';
+    return new Date(value).toLocaleString('zh-CN', { hour12: false });
+  }, []);
+
+  const isPermanentBan = useCallback((bannedUntil?: number | null) => {
+    const value = Number(bannedUntil);
+    return Number.isFinite(value) && value >= PERMANENT_BAN_THRESHOLD;
+  }, []);
+
   const getUserRankLabel = useCallback((user?: UserData | null) => {
     return user?.rank || '士兵';
   }, []);
@@ -795,45 +948,189 @@ export default function App() {
   useEffect(() => {
     if (!showRankBoard) return;
     let active = true;
+    const controller = new AbortController();
+    setRankBoardPage(1);
     setRankBoardLoading(true);
     setRankBoardError(null);
-    fetch(`${API_BASE}/users/leaderboard`)
-      .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load rank board failed: ${res.status}`)))
-      .then(data => {
+    const shouldUseAdminApi = isAdmin && Boolean(currentUser?.username);
+
+    (async () => {
+      try {
+        let data: any = null;
+        if (shouldUseAdminApi) {
+          const adminRes = await apiFetch(`${API_BASE}/users/admin/list`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal
+          });
+          if (adminRes.ok) {
+            data = await adminRes.json();
+          } else if (adminRes.status === 401 || adminRes.status === 403) {
+            const fallbackRes = await apiFetch(`${API_BASE}/users/leaderboard`, {
+              signal: controller.signal
+            });
+            if (!fallbackRes.ok) {
+              throw new Error(`Load rank board failed: ${fallbackRes.status}`);
+            }
+            data = await fallbackRes.json();
+          } else {
+            throw new Error(`Load rank board failed: ${adminRes.status}`);
+          }
+        } else {
+          const res = await apiFetch(`${API_BASE}/users/leaderboard`, {
+            signal: controller.signal
+          });
+          if (!res.ok) {
+            throw new Error(`Load rank board failed: ${res.status}`);
+          }
+          data = await res.json();
+        }
+
         if (!active) return;
-        const items = Array.isArray(data.items) ? data.items : [];
+        const items = Array.isArray(data?.items) ? data.items : [];
         const normalized = items.map((item: any) => ({
           username: String(item?.username || ''),
           rank: item?.rank || '士兵',
-          totalSeconds: Number(item?.totalSeconds) || 0
+          totalSeconds: Number(item?.totalSeconds) || 0,
+          lastLoginAt: item?.lastLoginAt == null ? null : Number(item?.lastLoginAt) || null,
+          bannedUntil: Number(item?.bannedUntil) || 0,
+          isAdmin: Boolean(item?.isAdmin)
         }));
         setRankBoard(normalized);
-      })
-      .catch(err => {
-        if (!active) return;
+      } catch (err: any) {
+        if (!active || err?.name === 'AbortError') return;
         console.error('Rank board error:', err);
         setRankBoardError('军衔榜加载失败，请稍后重试。');
-      })
-      .finally(() => {
+      } finally {
         if (active) setRankBoardLoading(false);
-      });
+      }
+    })();
+
     return () => {
       active = false;
+      controller.abort();
     };
-  }, [showRankBoard, rankBoardRefreshKey]);
+  }, [showRankBoard, rankBoardRefreshKey, isAdmin, currentUser?.username]);
+
+  const rankBoardTotalPages = Math.max(1, Math.ceil(rankBoard.length / RANK_BOARD_PAGE_SIZE));
+  const rankBoardVisibleItems = useMemo(() => {
+    const page = Math.min(rankBoardPage, rankBoardTotalPages);
+    const start = (page - 1) * RANK_BOARD_PAGE_SIZE;
+    return rankBoard.slice(start, start + RANK_BOARD_PAGE_SIZE);
+  }, [rankBoard, rankBoardPage, rankBoardTotalPages]);
+
+  const handleAdminBanUser = useCallback((item: RankBoardItem, action: 'ban' | 'unban') => {
+    if (!isAdmin || !currentUser) return;
+    const targetUsername = String(item.username || '').trim();
+    if (!targetUsername) return;
+    const actionText = action === 'ban' ? '封禁' : '解除封禁';
+    setConfirmModal({
+      isOpen: true,
+      title: 'MOSS WARNING: USER ACCESS CONTROL',
+      message: `确认对用户 ${targetUsername} 执行「${actionText}」吗？`,
+      variant: 'warning',
+      onConfirm: async () => {
+        const actionKey = `${action}:${targetUsername}`;
+        setRankActionLoadingKey(actionKey);
+        setRankBoardError(null);
+        try {
+          const res = await apiFetch(`${API_BASE}/users/admin/ban`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              targetUsername,
+              action
+            })
+          });
+          if (!res.ok) {
+            throw new Error(`Ban user failed: ${res.status}`);
+          }
+          setRankBoardRefreshKey((k) => k + 1);
+        } catch (error) {
+          console.error('Ban user error:', error);
+          setRankBoardError(action === 'ban' ? '封禁用户失败，请稍后重试。' : '解除封禁失败，请稍后重试。');
+        } finally {
+          setRankActionLoadingKey((key) => (key === actionKey ? null : key));
+        }
+      }
+    });
+  }, [isAdmin, currentUser]);
+
+  const handleAdminDeleteUser = useCallback((item: RankBoardItem) => {
+    if (!isAdmin || !currentUser) return;
+    const targetUsername = String(item.username || '').trim();
+    if (!targetUsername) return;
+    setConfirmModal({
+      isOpen: true,
+      title: 'MOSS WARNING: DELETE USER',
+      message: `确认彻底删除用户 ${targetUsername} 吗？该操作不可恢复。`,
+      variant: 'danger',
+      onConfirm: async () => {
+        const actionKey = `delete:${targetUsername}`;
+        setRankActionLoadingKey(actionKey);
+        setRankBoardError(null);
+        try {
+          const res = await apiFetch(`${API_BASE}/users/admin/delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              targetUsername
+            })
+          });
+          if (!res.ok) {
+            throw new Error(`Delete user failed: ${res.status}`);
+          }
+          setRankBoardRefreshKey((k) => k + 1);
+        } catch (error) {
+          console.error('Delete user error:', error);
+          setRankBoardError('删除用户失败，请稍后重试。');
+        } finally {
+          setRankActionLoadingKey((key) => (key === actionKey ? null : key));
+        }
+      }
+    });
+  }, [isAdmin, currentUser]);
 
   useEffect(() => {
     let active = true;
-    fetch(`${API_BASE}/tags`)
-      .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load tags failed: ${res.status}`)))
-      .then(data => {
+    const controller = new AbortController();
+    const win: any = window as any;
+    let timeoutId: number | null = null;
+    let idleId: number | null = null;
+    const loadTags = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/tags`, { signal: controller.signal });
+        if (!res.ok) {
+          throw new Error(`Load tags failed: ${res.status}`);
+        }
+        const data = await res.json();
         if (!active) return;
         const tags = Array.isArray(data.tags) ? data.tags : [];
         setAllTags(tags);
-      })
-      .catch(err => console.error('Load tags error:', err));
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        console.error('Load tags error:', err);
+      }
+    };
+
+    if (typeof win.requestIdleCallback === 'function') {
+      idleId = win.requestIdleCallback(() => {
+        void loadTags();
+      }, { timeout: 2000 });
+    } else {
+      timeoutId = window.setTimeout(() => {
+        void loadTags();
+      }, 1200);
+    }
     return () => {
       active = false;
+      controller.abort();
+      if (idleId !== null && typeof win.cancelIdleCallback === 'function') {
+        win.cancelIdleCallback(idleId);
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
     };
   }, []);
 
@@ -851,6 +1148,7 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     (async () => {
       try {
         const params = new URLSearchParams();
@@ -860,7 +1158,9 @@ export default function App() {
         params.set('sort', sortBy);
         if (searchKeyword) params.set('search', searchKeyword);
         if (selectedTag) params.set('tag', selectedTag);
-        const res = await fetch(`${API_BASE}/posts?${params.toString()}`);
+        const res = await apiFetch(`${API_BASE}/posts?${params.toString()}`, {
+          signal: controller.signal
+        });
         if (!res.ok) {
           throw new Error(`Load posts failed: ${res.status}`);
         }
@@ -874,12 +1174,14 @@ export default function App() {
             setCurrentPage(nextTotalPages);
           }
         }
-      } catch (error) {
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
         console.error('Load posts error:', error);
       }
     })();
     return () => {
       active = false;
+      controller.abort();
     };
   }, [currentPage, sortBy, selectedTag, searchKeyword, postsRefreshKey]);
 
@@ -893,18 +1195,52 @@ export default function App() {
     };
 
     const syncTime = async (deltaSeconds: number) => {
-      if (!currentUser.username || !currentUser.password || deltaSeconds <= 0) return;
+      if (!currentUser.username || deltaSeconds <= 0) return;
       try {
-        const res = await fetch(`${API_BASE}/users/heartbeat`, {
+        const res = await apiFetch(`${API_BASE}/users/heartbeat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            username: currentUser.username,
-            password: currentUser.password,
             deltaSeconds
           })
         });
         if (!res.ok) {
+          if (res.status === 401) {
+            try {
+              const meRes = await apiFetch(`${API_BASE}/auth/me`);
+              if (meRes.ok) {
+                const meData = await meRes.json();
+                const meUser = meData?.user;
+                if (meUser) {
+                  setCurrentUser({
+                    id: Number(meUser.id),
+                    username: String(meUser.username || currentUser.username),
+                    password: currentUser.password,
+                    isAdmin: Boolean(meUser.isAdmin),
+                    rank: meUser.rank || currentUser.rank || '士兵',
+                    totalSeconds: Number.isFinite(meUser.totalSeconds) ? Number(meUser.totalSeconds) : currentUser.totalSeconds
+                  });
+                  return;
+                }
+              }
+            } catch (_error) {
+              // keep default logout fallback below
+            }
+            setCurrentUser(null);
+            openAuthModal('login', '登录状态已失效，请重新登录。');
+            return;
+          }
+          if (res.status === 403) {
+            const data = await res.json().catch(() => null);
+            const bannedUntil = Number(data?.bannedUntil);
+            const bannedText = Number.isFinite(bannedUntil) && bannedUntil > Date.now()
+              ? (isPermanentBan(bannedUntil)
+                  ? '账号已被封禁，请联系管理员解除。'
+                  : `账号已被封禁，解封时间：${formatDateTime(bannedUntil)}`)
+              : '账号已被封禁，请联系管理员。';
+            setCurrentUser(null);
+            openAuthModal('login', bannedText);
+          }
           return;
         }
         const data = await res.json();
@@ -943,7 +1279,7 @@ export default function App() {
       if (intervalId) window.clearInterval(intervalId);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [currentUser, formatDuration, openRankNotice]);
+  }, [currentUser, formatDuration, openRankNotice, openAuthModal, formatDateTime, isPermanentBan]);
 
   const toggleMusic = useCallback(() => {
     const audio = document.getElementById('bgm') as HTMLAudioElement;
@@ -958,13 +1294,8 @@ export default function App() {
   const handleLogout = useCallback(async () => {
     if (!currentUser) return;
     try {
-      await fetch(`${API_BASE}/auth/logout`, {
+      await apiFetch(`${API_BASE}/auth/logout`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: currentUser.username,
-          password: currentUser.password
-        }),
         keepalive: true
       });
     } catch (error) {
@@ -979,11 +1310,11 @@ export default function App() {
 
   const handleLike = useCallback(async (id: string) => {
     if (!currentUser) {
-      setShowAuth(true);
+      openAuthModal('login', '请先登录后再互动。');
       return;
     }
     try {
-      const res = await fetch(`${API_BASE}/posts/${id}/like`, { method: 'POST' });
+      const res = await apiFetch(`${API_BASE}/posts/${id}/like`, { method: 'POST' });
       if (!res.ok) {
         throw new Error(`Like failed: ${res.status}`);
       }
@@ -992,12 +1323,24 @@ export default function App() {
     } catch (error) {
       console.error('Like Error:', error);
     }
-  }, [currentUser]);
+  }, [currentUser, openAuthModal]);
 
   const fetchDungeonLocation = async (): Promise<string> => {
+    const formatDungeon = (address: any) => {
+      const regionParts = [
+        address?.state,
+        address?.city || address?.town || address?.village || address?.county,
+        address?.suburb || address?.neighbourhood || address?.road
+      ]
+        .map((part) => String(part || '').trim())
+        .filter(Boolean);
+      const uniqueParts = Array.from(new Set(regionParts));
+      const label = uniqueParts.slice(0, 2).join('');
+      return `${label || '未知区域'}地下城`;
+    };
     return new Promise((resolve) => {
       if (!navigator.geolocation) {
-        resolve("未知扇区");
+        resolve("未知区域地下城");
         return;
       }
       navigator.geolocation.getCurrentPosition(
@@ -1006,13 +1349,12 @@ export default function App() {
             const { latitude, longitude } = position.coords;
             const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=zh`);
             const data = await res.json();
-            const city = data.address.city || data.address.province || data.address.state || "未知";
-            resolve(`${city}地下城`);
+            resolve(formatDungeon(data?.address));
           } catch (e) {
-            resolve("加密扇区地下城");
+            resolve("未知区域地下城");
           }
         },
-        () => resolve("地表幸存者基站"),
+        () => resolve("未知区域地下城"),
         { timeout: 5000 }
       );
     });
@@ -1021,7 +1363,7 @@ export default function App() {
   const uploadImage = useCallback(async (file: File) => {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch(`${API_BASE}/uploads`, {
+    const res = await apiFetch(`${API_BASE}/uploads`, {
       method: 'POST',
       body: formData
     });
@@ -1034,17 +1376,16 @@ export default function App() {
 
   const handleAddComment = useCallback(async (postId: string, comment: string, imageUrl?: string) => {
     if (!currentUser) {
-      setShowAuth(true);
+      openAuthModal('login', '请先登录后再发表评论。');
       return false;
     }
     if (!comment.trim() && !imageUrl) return false;
     const dungeon = await fetchDungeonLocation();
     try {
-      const res = await fetch(`${API_BASE}/posts/${postId}/comments`, {
+      const res = await apiFetch(`${API_BASE}/posts/${postId}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          author: currentUser.username,
           content: comment,
           imageUrl: imageUrl || null,
           location: dungeon
@@ -1063,15 +1404,15 @@ export default function App() {
       console.error('Add Comment Error:', error);
       return false;
     }
-  }, [currentUser]);
+  }, [currentUser, openAuthModal]);
 
   const handleLikeComment = useCallback(async (postId: string, commentId: string) => {
     if (!currentUser) {
-      setShowAuth(true);
+      openAuthModal('login', '请先登录后再互动。');
       return null;
     }
     try {
-      const res = await fetch(`${API_BASE}/comments/${commentId}/like`, { method: 'POST' });
+      const res = await apiFetch(`${API_BASE}/comments/${commentId}/like`, { method: 'POST' });
       if (!res.ok) {
         throw new Error(`Like comment failed: ${res.status}`);
       }
@@ -1086,7 +1427,7 @@ export default function App() {
       console.error('Like Comment Error:', error);
       return null;
     }
-  }, [currentUser]);
+  }, [currentUser, openAuthModal]);
 
   const handleDeleteComment = useCallback((postId: string, commentId: string) => {
     if (!isAdmin || !currentUser) return Promise.resolve(false);
@@ -1097,10 +1438,8 @@ export default function App() {
         message: 'Confirm delete this comment?',
         onConfirm: async () => {
           try {
-            const res = await fetch(`${API_BASE}/posts/${postId}/comments/${commentId}`, {
-              method: 'DELETE',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
+            const res = await apiFetch(`${API_BASE}/posts/${postId}/comments/${commentId}`, {
+              method: 'DELETE'
             });
             if (!res.ok) {
               throw new Error(`Delete comment failed: ${res.status}`);
@@ -1132,10 +1471,8 @@ export default function App() {
       message: 'Confirm delete this post?',
       onConfirm: async () => {
         try {
-          const res = await fetch(`${API_BASE}/posts/${id}`, {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: currentUser.username, password: currentUser.password })
+          const res = await apiFetch(`${API_BASE}/posts/${id}`, {
+            method: 'DELETE'
           });
           if (!res.ok) {
             throw new Error(`Delete post failed: ${res.status}`);
@@ -1152,19 +1489,48 @@ export default function App() {
 
   const handleAuth = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    const username = (formData.get('username') as string).trim();
-    const password = formData.get('password') as string;
-    if (!username || !password) return;
-
-    const localUser = users.find(u => u.username === username);
-    if (localUser && localUser.password !== password) {
-      setAuthError('密码输入错误');
+    const username = authUsername.trim();
+    const password = authPassword;
+    setAuthError(null);
+    setAuthInfo(null);
+    if (!username || !password) {
+      setAuthError('请输入账号和密码');
       return;
     }
 
+    if (authMode === 'register') {
+      if (password !== authConfirmPassword) {
+        setAuthError('两次输入的密码不一致');
+        return;
+      }
+      try {
+        const registerRes = await apiFetch(`${API_BASE}/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        if (registerRes.ok) {
+          setAuthMode('login');
+          setAuthPassword('');
+          setAuthConfirmPassword('');
+          setAuthInfo('注册成功，请登录');
+          return;
+        }
+        if (registerRes.status === 409) {
+          setAuthError('用户名已存在');
+          return;
+        }
+        setAuthError('注册失败，请稍后重试。');
+        return;
+      } catch (error) {
+        console.error('Register Error:', error);
+        setAuthError('服务器不可用，请稍后重试。');
+        return;
+      }
+    }
+
     try {
-      const loginRes = await fetch(`${API_BASE}/auth/login`, {
+      const loginRes = await apiFetch(`${API_BASE}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
@@ -1174,19 +1540,17 @@ export default function App() {
         const data = await loginRes.json();
         const serverUser = data?.user || {};
         const newUser: UserData = {
-          username,
+          id: Number(serverUser.id),
+          username: String(serverUser.username || username),
           password,
-          rank: serverUser.rank || localUser?.rank,
-          totalSeconds: Number.isFinite(serverUser.totalSeconds) ? serverUser.totalSeconds : localUser?.totalSeconds
+          isAdmin: Boolean(serverUser.isAdmin),
+          rank: serverUser.rank || '士兵',
+          totalSeconds: Number.isFinite(serverUser.totalSeconds) ? Number(serverUser.totalSeconds) : 0
         };
-        setUsers(prev => {
-          const exists = prev.some(u => u.username === username);
-          if (!exists) return [...prev, newUser];
-          return prev.map(u => u.username === username ? { ...u, ...newUser } : u);
-        });
         setCurrentUser(newUser);
         setShowAuth(false);
         setAuthError(null);
+        setAuthInfo(null);
         openWelcome(newUser.username, newUser.rank);
         void fetchOnlineCount();
         return;
@@ -1199,6 +1563,19 @@ export default function App() {
 
       if (loginRes.status === 401) {
         setAuthError('密码输入错误');
+        return;
+      }
+
+      if (loginRes.status === 403) {
+        const data = await loginRes.json().catch(() => null);
+        const bannedUntil = Number(data?.bannedUntil);
+        if (Number.isFinite(bannedUntil) && bannedUntil > Date.now()) {
+          setAuthError(isPermanentBan(bannedUntil)
+            ? '账号已被封禁，请联系管理员解除。'
+            : `账号已被封禁，解封时间：${formatDateTime(bannedUntil)}`);
+        } else {
+          setAuthError('账号已被封禁，请联系管理员。');
+        }
         return;
       }
 
@@ -1236,13 +1613,19 @@ export default function App() {
     const tags = tagsInput.split(',').map(t => t.trim()).filter(Boolean);
     let finalExcerpt = editingPost?.excerpt || '';
     if (!editingPost || editingPost.content !== content) {
-      finalExcerpt = await generateExcerpt(title, content);
+      try {
+        const { generateExcerpt } = await loadGeminiService();
+        finalExcerpt = await generateExcerpt(title, content);
+      } catch (error) {
+        console.error('Load excerpt service error:', error);
+        finalExcerpt = '矩阵未能生成摘要。';
+      }
     }
     const currentImage = uploadedImageUrl || editingPost?.imageUrl || DEFAULT_COVER;
 
     try {
       if (editingPost) {
-        const res = await fetch(`${API_BASE}/posts/${editingPost.id}`, {
+        const res = await apiFetch(`${API_BASE}/posts/${editingPost.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1250,9 +1633,7 @@ export default function App() {
             content,
             excerpt: finalExcerpt,
             tags,
-            imageUrl: currentImage,
-            username: currentUser.username,
-            password: currentUser.password
+            imageUrl: currentImage
           })
         });
         if (!res.ok) {
@@ -1264,18 +1645,15 @@ export default function App() {
         setAllTags(prev => Array.from(new Set([...prev, ...tags])));
         setPostsRefreshKey(key => key + 1);
       } else {
-        const res = await fetch(`${API_BASE}/posts`, {
+        const res = await apiFetch(`${API_BASE}/posts`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             title,
             content,
             excerpt: finalExcerpt,
-            author: currentUser.username,
             tags,
-            imageUrl: currentImage,
-            username: currentUser.username,
-            password: currentUser.password
+            imageUrl: currentImage
           })
         });
         if (!res.ok) {
@@ -1294,12 +1672,15 @@ export default function App() {
     setIsEditorOpen(false);
     setEditingPost(null);
     setUploadedImageUrl(null);
+    window.requestAnimationFrame(() => {
+      ensureRocketCursorEnabled();
+    });
   };
 
   const viewPost = useCallback((id: string) => {
     setSelectedPostId(id);
     setPosts(prev => prev.map(p => p.id === id ? { ...p, views: p.views + 1 } : p));
-    fetch(`${API_BASE}/posts/${id}/view`, { method: 'POST' })
+    apiFetch(`${API_BASE}/posts/${id}/view`, { method: 'POST' })
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (!data) return;
@@ -1311,7 +1692,7 @@ export default function App() {
     const needsDetail = !target || !target.content;
     if (needsDetail) {
       setPostDetailLoadingId(id);
-      fetch(`${API_BASE}/posts/${id}`)
+      apiFetch(`${API_BASE}/posts/${id}`)
         .then(res => res.ok ? res.json() : Promise.reject(new Error(`Load post failed: ${res.status}`)))
         .then(data => {
           const fullPost = data?.post;
@@ -1347,17 +1728,47 @@ export default function App() {
             <button onClick={() => setShowAuth(false)} className="absolute top-4 right-4 text-red-500 hover:text-white"><X size={24}/></button>
             <div className="text-center mb-8">
               <div className="w-16 h-16 bg-red-600 mx-auto mb-4 flex items-center justify-center font-bold text-2xl text-white shadow-[0_0_20px_rgba(255,0,0,0.5)] uppercase font-orbitron">LX</div>
-              <h2 className="text-2xl font-orbitron text-red-500 uppercase tracking-widest cyber-glow-red">Terminal Access</h2>
+              <h2 className="text-2xl font-orbitron text-red-500 uppercase tracking-widest cyber-glow-red">
+                {authMode === 'login' ? 'Terminal Access' : 'Terminal Register'}
+              </h2>
               <p className="text-[10px] text-red-900 font-mono mt-1 uppercase">Unified Government Identification Protocol</p>
+            </div>
+            <div className="grid grid-cols-2 gap-2 mb-6">
+              <button
+                type="button"
+                onClick={() => switchAuthMode('login')}
+                className={`py-2 text-xs font-orbitron uppercase tracking-widest border transition-colors ${
+                  authMode === 'login'
+                    ? 'border-red-500 bg-red-900/30 text-red-300'
+                    : 'border-red-900/60 text-red-700 hover:text-red-400 hover:border-red-700'
+                }`}
+              >
+                登录
+              </button>
+              <button
+                type="button"
+                onClick={() => switchAuthMode('register')}
+                className={`py-2 text-xs font-orbitron uppercase tracking-widest border transition-colors ${
+                  authMode === 'register'
+                    ? 'border-red-500 bg-red-900/30 text-red-300'
+                    : 'border-red-900/60 text-red-700 hover:text-red-400 hover:border-red-700'
+                }`}
+              >
+                注册
+              </button>
             </div>
             <form onSubmit={handleAuth} className="space-y-6">
               <div className="space-y-1">
                 <label className="text-[10px] text-red-600 uppercase font-orbitron tracking-widest flex items-center gap-2"><User size={12}/> Identifier</label>
                 <input
-                  name="username"
                   required
                   placeholder="USERNAME_STRING..."
-                  onChange={() => authError && setAuthError(null)}
+                  value={authUsername}
+                  onChange={(e) => {
+                    setAuthUsername(e.target.value);
+                    if (authError) setAuthError(null);
+                    if (authInfo) setAuthInfo(null);
+                  }}
                   className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"
                 />
               </div>
@@ -1365,20 +1776,55 @@ export default function App() {
                 <label className="text-[10px] text-red-600 uppercase font-orbitron tracking-widest flex items-center gap-2"><Lock size={12}/> Encryption Key</label>
                 <input
                   type="password"
-                  name="password"
                   required
                   placeholder="PASSWORD_MODULE..."
-                  onChange={() => authError && setAuthError(null)}
+                  value={authPassword}
+                  onChange={(e) => {
+                    setAuthPassword(e.target.value);
+                    if (authError) setAuthError(null);
+                    if (authInfo) setAuthInfo(null);
+                  }}
                   className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"
                 />
               </div>
+              {authMode === 'register' && (
+                <div className="space-y-1">
+                  <label className="text-[10px] text-red-600 uppercase font-orbitron tracking-widest flex items-center gap-2"><Lock size={12}/> Confirm Key</label>
+                  <input
+                    type="password"
+                    required
+                    placeholder="CONFIRM_PASSWORD..."
+                    value={authConfirmPassword}
+                    onChange={(e) => {
+                      setAuthConfirmPassword(e.target.value);
+                      if (authError) setAuthError(null);
+                      if (authInfo) setAuthInfo(null);
+                    }}
+                    className="w-full bg-black/40 border border-red-500/30 p-3 text-red-400 focus:outline-none focus:border-red-500 font-mono placeholder-red-900 transition-all"
+                  />
+                </div>
+              )}
               {authError && (
                 <div className="border border-red-700/60 bg-red-950/40 p-3 text-xs text-red-200 font-mono" role="alert">
                   {authError}
                 </div>
               )}
+              {authInfo && (
+                <div className="border border-emerald-700/60 bg-emerald-950/40 p-3 text-xs text-emerald-200 font-mono" role="status">
+                  {authInfo}
+                </div>
+              )}
               <div className="pt-4 space-y-3">
-                <CyberButton type="submit" variant="secondary" className="w-full py-4 text-lg">执行终端接入</CyberButton>
+                <CyberButton type="submit" variant="secondary" className="w-full py-4 text-lg">
+                  {authMode === 'login' ? '执行终端接入' : '执行注册'}
+                </CyberButton>
+                <button
+                  type="button"
+                  onClick={() => switchAuthMode(authMode === 'login' ? 'register' : 'login')}
+                  className="w-full text-[10px] text-red-700 hover:text-red-400 font-orbitron uppercase tracking-widest transition-colors"
+                >
+                  {authMode === 'login' ? '没有账号？前往注册' : '已有账号？前往登录'}
+                </button>
               </div>
             </form>
           </div>
@@ -1435,7 +1881,7 @@ export default function App() {
 
       {showRankBoard && (
         <div className="fixed inset-0 z-[210] flex items-start sm:items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-in fade-in duration-300 modal-backdrop">
-          <div className="cyber-border-red bg-black w-full max-w-2xl p-6 pt-10 relative shadow-[0_0_50px_rgba(255,0,0,0.3)] max-h-[calc(100vh-2rem)] overflow-y-auto">
+          <div className={`cyber-border-red bg-black w-full ${isAdmin ? 'max-w-5xl' : 'max-w-2xl'} p-6 pt-10 relative shadow-[0_0_50px_rgba(255,0,0,0.3)] max-h-[calc(100vh-2rem)] overflow-y-auto`}>
             <button
               onClick={() => setShowRankBoard(false)}
               className="absolute top-3 right-3 text-red-500 hover:text-white"
@@ -1467,20 +1913,120 @@ export default function App() {
                   )}
                   {!rankBoardLoading && !rankBoardError && rankBoard.length > 0 && (
                     <div className="space-y-2 text-sm text-red-200 font-mono">
-                      <div className="flex items-center justify-between text-xs text-red-500 border-b border-red-900/40 pb-1">
-                        <span className="w-6">#</span>
-                        <span className="flex-1 px-3">用户名</span>
-                        <span className="w-16 text-right">军衔</span>
-                        <span className="w-32 text-right">已执行任务</span>
+                      <div
+                        className={`grid items-center gap-2 text-xs text-red-500 border-b border-red-900/40 pb-1 ${
+                          isAdmin
+                            ? 'grid-cols-[2rem_minmax(6rem,1fr)_11rem_4rem]'
+                            : 'grid-cols-[2rem_minmax(6rem,1fr)_4rem_8rem]'
+                        }`}
+                      >
+                        <span>#</span>
+                        <span className="whitespace-nowrap">用户名</span>
+                        {isAdmin ? <span className="text-right">最近登录</span> : <span className="text-right">已执行任务</span>}
+                        <span className="text-right">军衔</span>
                       </div>
-                      {rankBoard.map((item, index) => (
-                        <div key={`${item.username}_${item.rank}`} className="flex items-center justify-between border-b border-red-900/40 pb-1">
-                          <span className="text-red-500 w-6">{index + 1}</span>
-                          <span className="flex-1 px-3">{item.username}</span>
-                          <span className="text-red-300 w-16 text-right">{item.rank}</span>
-                          <span className="text-red-600 w-32 text-right">已执行任务{item.totalSeconds}秒</span>
+
+                      {rankBoardVisibleItems.map((item, index) => {
+                        const listIndex = (rankBoardPage - 1) * RANK_BOARD_PAGE_SIZE + index + 1;
+                        const isTargetAdmin = Boolean(item.isAdmin);
+                        const isBanned = Number(item.bannedUntil) > Date.now();
+                        const isPermanentBannedUser = isPermanentBan(item.bannedUntil);
+                        const banActionKey = `ban:${item.username}`;
+                        const unbanActionKey = `unban:${item.username}`;
+                        const deleteActionKey = `delete:${item.username}`;
+                        const actionBusy = rankActionLoadingKey === banActionKey
+                          || rankActionLoadingKey === unbanActionKey
+                          || rankActionLoadingKey === deleteActionKey;
+                        return (
+                          <div key={item.username} className="border-b border-red-900/40 pb-2">
+                            <div
+                              className={`grid items-center gap-2 ${
+                                isAdmin
+                                  ? 'grid-cols-[2rem_minmax(6rem,1fr)_11rem_4rem]'
+                                  : 'grid-cols-[2rem_minmax(6rem,1fr)_4rem_8rem]'
+                              }`}
+                            >
+                              <span className="text-red-500">{listIndex}</span>
+                              <span className="truncate" title={item.username}>{item.username}</span>
+                              {isAdmin ? (
+                                <span className="text-right text-red-500">{formatDateTime(item.lastLoginAt)}</span>
+                              ) : (
+                                <span className="text-right text-red-600">{item.totalSeconds}秒</span>
+                              )}
+                              <span className="text-right text-red-300">{item.rank}</span>
+                            </div>
+
+                            {isAdmin && (
+                              <div className="mt-2 pl-8 flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-[11px] text-red-600">已执行任务{item.totalSeconds}秒</span>
+                                <div className="flex flex-wrap items-center justify-end gap-2">
+                                  <span className={`text-[11px] ${isBanned ? 'text-orange-400' : 'text-red-700'}`}>
+                                    {isBanned
+                                      ? (isPermanentBannedUser ? '已封禁（待解除）' : `封禁至 ${formatDateTime(item.bannedUntil)}`)
+                                      : '状态正常'}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    disabled={isTargetAdmin || actionBusy || isBanned}
+                                    onClick={() => handleAdminBanUser(item, 'ban')}
+                                    className={`px-2 py-1 border text-[10px] disabled:opacity-40 transition-colors ${
+                                      isBanned
+                                        ? 'border-orange-900/40 text-orange-900'
+                                        : 'border-orange-500/50 text-orange-300 hover:bg-orange-500/10'
+                                    }`}
+                                  >
+                                    封禁
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={isTargetAdmin || actionBusy || !isBanned}
+                                    onClick={() => handleAdminBanUser(item, 'unban')}
+                                    className={`px-2 py-1 border text-[10px] disabled:opacity-40 transition-colors ${
+                                      isBanned
+                                        ? 'border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10'
+                                        : 'border-emerald-900/40 text-emerald-900'
+                                    }`}
+                                  >
+                                    解除
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={isTargetAdmin || actionBusy}
+                                    onClick={() => handleAdminDeleteUser(item)}
+                                    className="px-2 py-1 border text-[10px] border-red-500/50 text-red-300 disabled:opacity-40 hover:bg-red-500/10 transition-colors"
+                                  >
+                                    删除
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      {rankBoard.length > RANK_BOARD_PAGE_SIZE && (
+                        <div className="pt-2 flex items-center justify-between">
+                          <span className="text-[10px] text-red-600 font-mono">PAGE {rankBoardPage} / {rankBoardTotalPages}</span>
+                          <div className="flex items-center gap-2">
+                            <CyberButton
+                              variant="secondary"
+                              className="px-2 py-1 text-[10px]"
+                              disabled={rankBoardPage === 1}
+                              onClick={() => setRankBoardPage((p) => Math.max(1, p - 1))}
+                            >
+                              上一页
+                            </CyberButton>
+                            <CyberButton
+                              variant="secondary"
+                              className="px-2 py-1 text-[10px]"
+                              disabled={rankBoardPage >= rankBoardTotalPages}
+                              onClick={() => setRankBoardPage((p) => Math.min(rankBoardTotalPages, p + 1))}
+                            >
+                              下一页
+                            </CyberButton>
+                          </div>
                         </div>
-                      ))}
+                      )}
                     </div>
                   )}
                 </div>
@@ -1602,7 +2148,7 @@ export default function App() {
               </CyberButton>
             </div>
           ) : (
-            <CyberButton onClick={() => setShowAuth(true)} variant="secondary">
+            <CyberButton onClick={() => openAuthModal('login')} variant="secondary">
               <LogIn className="w-4 h-4 inline mr-2" /> 终端接入
             </CyberButton>
           )}
@@ -1748,11 +2294,20 @@ const ArticleCard = React.memo<{
   isAdmin: boolean; 
   onDelete: () => void; 
   onEdit: (e: React.MouseEvent) => void; 
-}>(({ post, onClick, onLike, isAdmin, onDelete, onEdit }) => (
+}>(({ post, onClick, onLike, isAdmin, onDelete, onEdit }) => {
+  const listImageSrc = post.imageThumbUrl || post.imageUrl;
+  return (
   <article onClick={onClick} className="cyber-card cyber-border-red bg-black/40 overflow-hidden flex flex-col md:flex-row group cursor-pointer transition-all duration-300 hover:bg-black/60 shadow-lg">
-    {post.imageUrl && (
+    {listImageSrc && (
       <div className="w-full md:w-48 h-48 md:h-auto overflow-hidden shrink-0 bg-black/50 flex items-center justify-center border-r border-red-900/30">
-        <img src={post.imageUrl} className="w-full h-full object-cover grayscale opacity-60 group-hover:opacity-100 group-hover:grayscale-0 transition-all duration-500" alt={post.title} />
+        <img
+          src={listImageSrc}
+          loading="lazy"
+          decoding="async"
+          fetchPriority="low"
+          className="w-full h-full object-cover grayscale opacity-60 group-hover:opacity-100 group-hover:grayscale-0 transition-all duration-500"
+          alt={post.title}
+        />
       </div>
     )}
     <div className="p-5 flex-1 flex flex-col justify-between">
@@ -1780,7 +2335,8 @@ const ArticleCard = React.memo<{
       </div>
     </div>
   </article>
-));
+  );
+});
 
 const PostDetail = React.memo<{ 
   post: Post; 
@@ -1813,13 +2369,16 @@ const PostDetail = React.memo<{
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     (async () => {
       setCommentLoading(true);
       try {
         const params = new URLSearchParams();
         params.set('page', String(commentPage));
         params.set('pageSize', String(COMMENTS_PER_PAGE));
-        const res = await fetch(`${API_BASE}/posts/${post.id}/comments?${params.toString()}`);
+        const res = await apiFetch(`${API_BASE}/posts/${post.id}/comments?${params.toString()}`, {
+          signal: controller.signal
+        });
         if (!res.ok) {
           throw new Error(`Load comments failed: ${res.status}`);
         }
@@ -1833,7 +2392,8 @@ const PostDetail = React.memo<{
           return;
         }
         setComments(Array.isArray(data.comments) ? data.comments : []);
-      } catch (error) {
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
         console.error('Load comments error:', error);
       } finally {
         if (active) setCommentLoading(false);
@@ -1841,6 +2401,7 @@ const PostDetail = React.memo<{
     })();
     return () => {
       active = false;
+      controller.abort();
     };
   }, [post.id, commentPage, commentRefreshKey]);
 
@@ -1896,8 +2457,15 @@ const PostDetail = React.memo<{
       <button onClick={onBack} className="text-red-500 hover:text-white flex items-center gap-2 font-orbitron text-sm mb-4 transition-colors uppercase tracking-widest"><ChevronLeft size={16}/> Back To Root</button>
       <div className="cyber-border-red bg-black/60 overflow-hidden shadow-2xl">
         {post.imageUrl && (
-          <div className="w-full max-h-[50vh] overflow-hidden border-b border-red-500/30">
-            <img src={post.imageUrl} className="w-full h-full object-cover opacity-80" alt="Post Banner" />
+          <div className="w-full border-b border-red-500/30 bg-black/70 p-2 md:p-3 flex items-center justify-center">
+            <img
+              src={post.imageUrl}
+              loading="eager"
+              decoding="async"
+              fetchPriority="high"
+              className="max-w-full max-h-[70vh] object-contain opacity-90"
+              alt="Post Banner"
+            />
           </div>
         )}
         <div className="p-6">
@@ -1930,7 +2498,7 @@ const PostDetail = React.memo<{
           <textarea value={commentText} onChange={(e) => setCommentText(e.target.value)} placeholder="请输入您的应答内容..." className="w-full bg-black/60 border border-red-500/30 p-4 text-red-400 focus:outline-none mb-4 font-mono text-sm transition-colors" rows={3} />
           {commentImg && (
             <div className="mb-4 relative w-32 h-32 border border-red-500/30">
-              <img src={commentImg} className="w-full h-full object-cover grayscale opacity-70" alt="Visual" />
+              <img src={commentImg} className="w-full h-full object-cover opacity-95" alt="Visual" />
               <button onClick={() => setCommentImg(null)} className="absolute -top-2 -right-2 bg-red-600 rounded-full p-0.5"><X size={12}/></button>
             </div>
           )}
@@ -1953,14 +2521,25 @@ const PostDetail = React.memo<{
               {comments.map(c => (
                 <div key={c.id} className="cyber-border-red p-4 bg-red-900/10 border-l-2 border-l-red-500 animate-in slide-in-from-left duration-300 group">
                   <div className="flex justify-between mb-2 text-[10px] font-orbitron text-red-500">
-                    <span className="flex items-center gap-2">{c.author} {c.location && <span className="text-red-700 flex items-center gap-1"><MapPin size={10}/> {c.location}</span>}</span>
+                    <span className="flex items-center gap-2">{c.author} {c.location && <span className="text-red-700 flex items-center gap-1"><MapPin size={10}/> 地址 {c.location}</span>}</span>
                     <div className="flex items-center gap-4">
                       <span>{formatDateFull(c.createdAt)}</span>
                       {isAdmin && <button onClick={() => handleDeleteCommentLocal(c.id)} className="text-orange-600 hover:text-orange-400 transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={12}/></button>}
                     </div>
                   </div>
                   <p className="text-sm text-red-100/80 font-mono mb-3">{c.content}</p>
-                  {c.imageUrl && <div className="mb-3 max-w-sm border border-red-500/10"><img src={c.imageUrl} className="w-full h-auto grayscale opacity-80" alt="Attachment" /></div>}
+                  {(c.imageThumbUrl || c.imageUrl) && (
+                    <div className="mb-3 max-w-sm border border-red-500/10">
+                      <img
+                        src={c.imageThumbUrl || c.imageUrl}
+                        loading="lazy"
+                        decoding="async"
+                        fetchPriority="low"
+                        className="w-full h-auto opacity-95"
+                        alt="Attachment"
+                      />
+                    </div>
+                  )}
                   <div className="flex items-center gap-4">
                     <button onClick={() => handleLikeCommentLocal(c.id)} className="flex items-center gap-1 text-[10px] font-mono text-red-900 hover:text-red-500 transition-colors">
                       <ThumbsUp size={12} className={c.likes > 0 ? "text-red-500" : ""}/> {c.likes}
@@ -1984,3 +2563,4 @@ const PostDetail = React.memo<{
     </div>
   );
 });
+

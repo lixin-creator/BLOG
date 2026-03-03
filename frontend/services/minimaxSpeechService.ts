@@ -1,122 +1,79 @@
-const MINIMAX_API_KEY = import.meta.env.VITE_MINIMAX_API_KEY as string | undefined;
-const API_BASE = "https://api.minimax.io/v1";
+const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
-function ensureApiKey(): string {
-  if (!MINIMAX_API_KEY) {
-    throw new Error("Missing MiniMax API key");
+const createAuthHeaders = (base?: HeadersInit) => {
+  const headers = new Headers(base || {});
+  if (typeof window === "undefined") return headers;
+  try {
+    const raw = window.localStorage.getItem("lx_current_user");
+    if (!raw) return headers;
+    const user = JSON.parse(raw);
+    const username = String(user?.username || "").trim();
+    const password = String(user?.password || "");
+    if (!username || !password) return headers;
+    headers.set("X-Auth-Username", username);
+    headers.set("X-Auth-Password", password);
+  } catch (_error) {
+    // ignore invalid local cache
   }
-  return MINIMAX_API_KEY;
-}
+  return headers;
+};
 
 export async function uploadCloneAudio(file: File): Promise<number> {
-  const apiKey = ensureApiKey();
   const form = new FormData();
-  form.append("purpose", "voice_clone");
   form.append("file", file, file.name);
-
-  const response = await fetch(`${API_BASE}/files/upload`, {
+  const response = await fetch(`${API_BASE}/minimax/upload`, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`
-    },
+    credentials: "include",
+    headers: createAuthHeaders(),
     body: form
   });
-
   if (!response.ok) {
     throw new Error(`Upload failed: ${response.status}`);
   }
-
   const data = await response.json();
-  const fileId = data?.file?.file_id;
-  if (!fileId) {
-    throw new Error("Missing file_id in upload response");
+  const fileId = Number(data?.fileId);
+  if (!Number.isFinite(fileId)) {
+    throw new Error("Missing fileId in upload response");
   }
-
-  return Number(fileId);
+  return fileId;
 }
 
 export async function cloneVoice(fileId: number, voiceId: string, previewText?: string): Promise<string> {
-  const apiKey = ensureApiKey();
-  const response = await fetch(`${API_BASE}/voice_clone`, {
+  const response = await fetch(`${API_BASE}/minimax/clone`, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
+    credentials: "include",
+    headers: createAuthHeaders({
       "Content-Type": "application/json"
-    },
+    }),
     body: JSON.stringify({
-      file_id: fileId,
-      voice_id: voiceId,
-      model: "speech-2.8-hd",
-      text: previewText,
-      need_noise_reduction: true,
-      need_volumn_normalization: true,
-      continuous_sound: false
+      fileId,
+      voiceId,
+      previewText
     })
   });
-
   if (!response.ok) {
     throw new Error(`Clone failed: ${response.status}`);
   }
-
   const data = await response.json();
-  if (data?.base_resp?.status_code !== 0) {
-    throw new Error(data?.base_resp?.status_msg || "Clone failed");
-  }
-
-  return voiceId;
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  const len = clean.length;
-  const buffer = new ArrayBuffer(len / 2);
-  const out = new Uint8Array(buffer);
-  for (let i = 0; i < len; i += 2) {
-    out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
-  }
-  return out;
+  return String(data?.voiceId || voiceId);
 }
 
 export async function synthesizeSpeech(text: string, voiceId: string): Promise<Blob> {
-  const apiKey = ensureApiKey();
-  const input = text.length > 10000 ? text.slice(0, 10000) : text;
-  const response = await fetch(`${API_BASE}/t2a_v2`, {
+  const response = await fetch(`${API_BASE}/minimax/synthesize`, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
+    credentials: "include",
+    headers: createAuthHeaders({
       "Content-Type": "application/json"
-    },
+    }),
     body: JSON.stringify({
-      model: "speech-2.8-hd",
-      text: input,
-      stream: false,
-      output_format: "hex",
-      voice_setting: {
-        voice_id: voiceId,
-        speed: 1,
-        vol: 1,
-        pitch: 0
-      },
-      audio_setting: {
-        sample_rate: 32000,
-        bitrate: 128000,
-        format: "mp3",
-        channel: 1
-      }
+      text,
+      voiceId
     })
   });
-
   if (!response.ok) {
-    throw new Error(`T2A failed: ${response.status}`);
+    const detail = await response.text();
+    throw new Error(`T2A failed: ${response.status} ${detail}`);
   }
-
-  const data = await response.json();
-  const hexAudio = data?.data?.audio as string | undefined;
-  if (!hexAudio) {
-    throw new Error("Missing audio data");
-  }
-  const bytes = hexToBytes(hexAudio);
-  const safeBuffer = bytes.buffer.slice(0) as ArrayBuffer;
-  const safeBytes = new Uint8Array(safeBuffer);
-  return new Blob([safeBytes], { type: "audio/mpeg" });
+  const bytes = await response.arrayBuffer();
+  return new Blob([bytes], { type: response.headers.get("content-type") || "audio/mpeg" });
 }

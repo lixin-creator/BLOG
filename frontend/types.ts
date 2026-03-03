@@ -12,6 +12,7 @@ export interface Post {
   comments: Comment[];
   commentCount?: number;
   imageUrl?: string;
+  imageThumbUrl?: string;
 }
 
 export interface Comment {
@@ -21,6 +22,7 @@ export interface Comment {
   createdAt: number;
   likes: number;
   imageUrl?: string;
+  imageThumbUrl?: string;
   location?: string;
 }
 

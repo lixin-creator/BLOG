@@ -1,56 +1,47 @@
-﻿const ZHIPU_API_KEY = import.meta.env.VITE_ZHIPU_API_KEY as string | undefined;
-const API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+const API_BASE = import.meta.env.VITE_API_BASE || "/api";
+
+const createAuthHeaders = (base?: HeadersInit) => {
+  const headers = new Headers(base || {});
+  if (typeof window === "undefined") return headers;
+  try {
+    const raw = window.localStorage.getItem("lx_current_user");
+    if (!raw) return headers;
+    const user = JSON.parse(raw);
+    const username = String(user?.username || "").trim();
+    const password = String(user?.password || "");
+    if (!username || !password) return headers;
+    headers.set("X-Auth-Username", username);
+    headers.set("X-Auth-Password", password);
+  } catch (_error) {
+    // ignore invalid local cache
+  }
+  return headers;
+};
 
 export async function generateExcerpt(title: string, content: string): Promise<string> {
   try {
-    const response = await fetch(API_URL, {
+    const response = await fetch(`${API_BASE}/ai/excerpt`, {
       method: "POST",
-      headers: {
+      credentials: "include",
+      headers: createAuthHeaders({
         "Content-Type": "application/json; charset=utf-8",
-        "Accept": "application/json",
-        "Authorization": `Bearer ${ZHIPU_API_KEY ?? ""}`
-      },
-      body: JSON.stringify({
-        model: "glm-4",
-        messages: [
-          {
-            role: "system",
-            content: "你是摘要生成器。输出中文摘要，风格为赛博朋克，长度不超过50字。"
-          },
-          {
-            role: "user",
-            content: `请为这篇名为“${title}”的博客文章生成摘要：\n\n${content}`
-          }
-        ],
-        stream: false
-      })
+        "Accept": "application/json"
+      }),
+      body: JSON.stringify({ title, content })
     });
 
-    const buffer = await response.arrayBuffer();
-    const utf8Text = new TextDecoder("utf-8").decode(buffer);
-    let data: any = null;
-    try {
-      data = JSON.parse(utf8Text);
-    } catch {
-      try {
-        const gbkText = new TextDecoder("gbk").decode(buffer);
-        data = JSON.parse(gbkText);
-      } catch {
-        data = null;
-      }
+    if (!response.ok) {
+      throw new Error(`Excerpt failed: ${response.status}`);
     }
 
-    if (!data) {
-      throw new Error("Invalid JSON response");
-    }
-
-    return data?.choices?.[0]?.message?.content || "正在扫描频率... 暂无摘要。";
+    const data = await response.json();
+    return data?.excerpt || "正在扫描频率... 暂无摘要。";
   } catch (error) {
     console.error("AI Error:", error);
     return "矩阵未能生成摘要。";
   }
 }
 
-export async function suggestTags(content: string): Promise<string[]> {
+export async function suggestTags(_content: string): Promise<string[]> {
   return ["常规", "技术"];
 }
