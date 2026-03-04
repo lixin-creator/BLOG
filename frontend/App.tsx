@@ -1325,41 +1325,6 @@ export default function App() {
     }
   }, [currentUser, openAuthModal]);
 
-  const fetchDungeonLocation = async (): Promise<string> => {
-    const formatDungeon = (address: any) => {
-      const regionParts = [
-        address?.state,
-        address?.city || address?.town || address?.village || address?.county,
-        address?.suburb || address?.neighbourhood || address?.road
-      ]
-        .map((part) => String(part || '').trim())
-        .filter(Boolean);
-      const uniqueParts = Array.from(new Set(regionParts));
-      const label = uniqueParts.slice(0, 2).join('');
-      return `${label || '未知区域'}地下城`;
-    };
-    return new Promise((resolve) => {
-      if (!navigator.geolocation) {
-        resolve("未知区域地下城");
-        return;
-      }
-      navigator.geolocation.getCurrentPosition(
-        async (position) => {
-          try {
-            const { latitude, longitude } = position.coords;
-            const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${latitude}&lon=${longitude}&accept-language=zh`);
-            const data = await res.json();
-            resolve(formatDungeon(data?.address));
-          } catch (e) {
-            resolve("未知区域地下城");
-          }
-        },
-        () => resolve("未知区域地下城"),
-        { timeout: 5000 }
-      );
-    });
-  };
-
   const uploadImage = useCallback(async (file: File) => {
     const formData = new FormData();
     formData.append('file', file);
@@ -1380,15 +1345,13 @@ export default function App() {
       return false;
     }
     if (!comment.trim() && !imageUrl) return false;
-    const dungeon = await fetchDungeonLocation();
     try {
       const res = await apiFetch(`${API_BASE}/posts/${postId}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content: comment,
-          imageUrl: imageUrl || null,
-          location: dungeon
+          imageUrl: imageUrl || null
         })
       });
       if (!res.ok) {
@@ -1880,8 +1843,8 @@ export default function App() {
       )}
 
       {showRankBoard && (
-        <div className="fixed inset-0 z-[210] flex items-start sm:items-center justify-center bg-black/90 backdrop-blur-md p-4 animate-in fade-in duration-300 modal-backdrop">
-          <div className={`cyber-border-red bg-black w-full ${isAdmin ? 'max-w-5xl' : 'max-w-2xl'} p-6 pt-10 relative shadow-[0_0_50px_rgba(255,0,0,0.3)] max-h-[calc(100vh-2rem)] overflow-y-auto`}>
+        <div className="rank-board-modal fixed inset-0 z-[210] flex items-start sm:items-center justify-center bg-black/90 backdrop-blur-md p-0 sm:p-4 animate-in fade-in duration-300 modal-backdrop">
+          <div className={`rank-board-panel cyber-border-red bg-black w-full ${isAdmin ? 'max-w-5xl' : 'max-w-2xl'} p-4 sm:p-6 pt-10 relative shadow-[0_0_50px_rgba(255,0,0,0.3)] max-h-[calc(100vh-2rem)] overflow-y-auto`}>
             <button
               onClick={() => setShowRankBoard(false)}
               className="absolute top-3 right-3 text-red-500 hover:text-white"
@@ -1893,7 +1856,7 @@ export default function App() {
               <h2 className="text-xl font-orbitron text-red-500 uppercase tracking-widest flex items-center gap-2">
                 <ShieldCheck size={20} /> 军衔榜
               </h2>
-              <CyberButton variant="secondary" onClick={() => setRankBoardRefreshKey(k => k + 1)} className="text-sm px-3 py-2">
+              <CyberButton variant="secondary" onClick={() => setRankBoardRefreshKey(k => k + 1)} className="text-xs sm:text-sm px-2.5 sm:px-3 py-2">
                 刷新
               </CyberButton>
             </div>
@@ -1901,7 +1864,7 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-3">
                 <h3 className="text-sm font-orbitron text-red-400 uppercase tracking-widest">Ranking</h3>
-                <div className="border border-red-600/30 bg-black/40 p-3 min-h-[200px]">
+                <div className="border border-red-600/30 bg-black/40 p-2.5 sm:p-3 min-h-[200px]">
                   {rankBoardLoading && (
                     <p className="text-sm text-red-400 font-mono">加载中...</p>
                   )}
@@ -1912,18 +1875,24 @@ export default function App() {
                     <p className="text-sm text-red-400 font-mono">暂无数据</p>
                   )}
                   {!rankBoardLoading && !rankBoardError && rankBoard.length > 0 && (
-                    <div className="space-y-2 text-sm text-red-200 font-mono">
+                    <div className="space-y-2 text-xs sm:text-sm text-red-200 font-mono rank-board-scroll overflow-x-hidden">
                       <div
-                        className={`grid items-center gap-2 text-xs text-red-500 border-b border-red-900/40 pb-1 ${
-                          isAdmin
-                            ? 'grid-cols-[2rem_minmax(6rem,1fr)_11rem_4rem]'
-                            : 'grid-cols-[2rem_minmax(6rem,1fr)_4rem_8rem]'
-                        }`}
+                        className={`rank-board-grid grid items-center gap-2 text-xs text-red-500 border-b border-red-900/40 pb-1 ${isAdmin ? 'rank-board-grid-admin' : 'rank-board-grid-user'}`}
                       >
-                        <span>#</span>
-                        <span className="whitespace-nowrap">用户名</span>
-                        {isAdmin ? <span className="text-right">最近登录</span> : <span className="text-right">已执行任务</span>}
-                        <span className="text-right">军衔</span>
+                        {isAdmin ? (
+                          <>
+                            <span>#</span>
+                            <span className="whitespace-nowrap">用户名</span>
+                            <span className="text-right">军衔</span>
+                            <span className="text-right">最近登录</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="whitespace-nowrap">用户名</span>
+                            <span className="text-center">军衔</span>
+                            <span className="text-center">已执行任务</span>
+                          </>
+                        )}
                       </div>
 
                       {rankBoardVisibleItems.map((item, index) => {
@@ -1940,20 +1909,22 @@ export default function App() {
                         return (
                           <div key={item.username} className="border-b border-red-900/40 pb-2">
                             <div
-                              className={`grid items-center gap-2 ${
-                                isAdmin
-                                  ? 'grid-cols-[2rem_minmax(6rem,1fr)_11rem_4rem]'
-                                  : 'grid-cols-[2rem_minmax(6rem,1fr)_4rem_8rem]'
-                              }`}
+                              className={`rank-board-row grid items-center gap-2 ${isAdmin ? 'rank-board-grid-admin' : 'rank-board-grid-user'}`}
                             >
-                              <span className="text-red-500">{listIndex}</span>
-                              <span className="truncate" title={item.username}>{item.username}</span>
                               {isAdmin ? (
-                                <span className="text-right text-red-500">{formatDateTime(item.lastLoginAt)}</span>
+                                <>
+                                  <span className="text-red-500">{listIndex}</span>
+                                  <span className="min-w-0 truncate" title={item.username}>{item.username}</span>
+                                  <span className="text-right text-red-300 whitespace-nowrap">{item.rank}</span>
+                                  <span className="text-right text-red-500 text-[11px] sm:text-sm whitespace-nowrap">{formatDateTime(item.lastLoginAt)}</span>
+                                </>
                               ) : (
-                                <span className="text-right text-red-600">{item.totalSeconds}秒</span>
+                                <>
+                                  <span className="min-w-0 truncate" title={item.username}>{listIndex}. {item.username}</span>
+                                  <span className="text-center text-red-300 whitespace-nowrap">{item.rank}</span>
+                                  <span className="text-center text-red-600 whitespace-nowrap">{item.totalSeconds}秒</span>
+                                </>
                               )}
-                              <span className="text-right text-red-300">{item.rank}</span>
                             </div>
 
                             {isAdmin && (
@@ -2005,7 +1976,7 @@ export default function App() {
                       })}
 
                       {rankBoard.length > RANK_BOARD_PAGE_SIZE && (
-                        <div className="pt-2 flex items-center justify-between">
+                        <div className="pt-2 flex flex-wrap items-center justify-between gap-2">
                           <span className="text-[10px] text-red-600 font-mono">PAGE {rankBoardPage} / {rankBoardTotalPages}</span>
                           <div className="flex items-center gap-2">
                             <CyberButton

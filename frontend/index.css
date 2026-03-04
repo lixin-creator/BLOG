@@ -79,6 +79,64 @@ body.modal-open .modal-backdrop {
   cursor: grab;
 }
 
+.rank-board-modal {
+  justify-content: center;
+}
+
+.rank-board-panel {
+  overflow-x: hidden;
+}
+
+.rank-board-grid.rank-board-grid-user,
+.rank-board-row.rank-board-grid-user {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.rank-board-grid.rank-board-grid-admin,
+.rank-board-row.rank-board-grid-admin {
+  grid-template-columns: 2rem minmax(6rem, 1fr) 4rem 11rem;
+}
+
+@media (max-width: 640px) {
+  .rank-board-modal {
+    justify-content: flex-start;
+    padding-left: 0 !important;
+    padding-right: 0.75rem !important;
+  }
+
+  .rank-board-panel {
+    width: calc(100vw - 1.5rem);
+    max-width: calc(100vw - 1.5rem);
+    margin-left: 0.25rem;
+    margin-right: auto;
+    max-height: calc(100vh - 1.5rem);
+    transform: none;
+  }
+
+  .rank-board-grid.rank-board-grid-user,
+  .rank-board-row.rank-board-grid-user {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.25rem;
+  }
+
+  .rank-board-grid.rank-board-grid-admin,
+  .rank-board-row.rank-board-grid-admin {
+    grid-template-columns: 1.25rem minmax(0, 1fr) 2.8rem 6rem;
+    gap: 0.25rem;
+  }
+
+  .rank-board-scroll .rank-board-grid,
+  .rank-board-scroll .rank-board-row {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .rank-board-scroll {
+    padding-right: 0;
+    overflow-x: hidden;
+  }
+}
+
 @keyframes mossSpin {
   to {
     transform: rotate(360deg);
